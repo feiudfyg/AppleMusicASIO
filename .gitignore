@@ -1,0 +1,11 @@
+# Build output
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+# Runtime artefacts
+AMAudioBridge.log
+*.log
+*.dmp
