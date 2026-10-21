@@ -35,14 +35,8 @@ static BOOL TryOneExclusive(IAudioClient* client, const RealClientFns* fns,
         if (closest) CoTaskMemFree(closest);
         return TRUE;
     }
-    if (hr == S_FALSE && closest) {
-        AmbAudioFormat c;
-        if (Format_Parse(&c, closest) && c.channels == cand->channels) {
-            *out = c;
-            CoTaskMemFree(closest);
-            return TRUE;
-        }
-    }
+    /* For exclusive mode, S_FALSE is not a usable "closest match"; the
+       device must accept the exact format or we fall back to shared. */
     if (closest) CoTaskMemFree(closest);
     return FALSE;
 }

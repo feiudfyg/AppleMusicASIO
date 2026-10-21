@@ -2,7 +2,7 @@
 
 static CRITICAL_SECTION g_log_cs;
 static BOOL g_log_cs_ready = FALSE;
-static FILE* g_log_file = NULL;
+static HANDLE g_log_handle = INVALID_HANDLE_VALUE;
 static int g_log_level = 2;
 static wchar_t g_log_dir[MAX_PATH] = L".";
 
@@ -22,6 +22,14 @@ static void Log_MakeDir(const wchar_t* dir)
     CreateDirectoryW(tmp, NULL);
 }
 
+static void Log_OpenFile(const wchar_t* path)
+{
+    g_log_handle = CreateFileW(path, FILE_APPEND_DATA,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (g_log_handle == INVALID_HANDLE_VALUE) g_log_handle = NULL;
+}
+
 void Log_Init(HMODULE module)
 {
     InitializeCriticalSection(&g_log_cs);
@@ -39,7 +47,8 @@ void Log_Init(HMODULE module)
 
     wchar_t log_path[MAX_PATH];
     _snwprintf_s(log_path, MAX_PATH, _TRUNCATE, L"%s\\AMAudioBridge.log", g_log_dir);
-    if (_wfopen_s(&g_log_file, log_path, L"ab") != 0 || !g_log_file) {
+    Log_OpenFile(log_path);
+    if (!g_log_handle) {
         wchar_t base[MAX_PATH] = L"";
         DWORD len = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
         if (len > 0 && len < MAX_PATH) {
@@ -47,9 +56,7 @@ void Log_Init(HMODULE module)
             _snwprintf_s(dir, MAX_PATH, _TRUNCATE, L"%s\\AppleMusicASIO", base);
             Log_MakeDir(dir);
             _snwprintf_s(log_path, MAX_PATH, _TRUNCATE, L"%s\\bridge.log", dir);
-            if (_wfopen_s(&g_log_file, log_path, L"ab") != 0) {
-                g_log_file = NULL;
-            }
+            Log_OpenFile(log_path);
         }
     }
 
@@ -64,10 +71,9 @@ void Log_Close(void)
 {
     if (g_log_cs_ready) {
         EnterCriticalSection(&g_log_cs);
-        if (g_log_file) {
-            fflush(g_log_file);
-            fclose(g_log_file);
-            g_log_file = NULL;
+        if (g_log_handle) {
+            CloseHandle(g_log_handle);
+            g_log_handle = NULL;
         }
         LeaveCriticalSection(&g_log_cs);
         DeleteCriticalSection(&g_log_cs);
@@ -94,6 +100,8 @@ const wchar_t* Log_Dir(void)
 
 void Log_Write(int level, const char* file, int line, const char* fmt, ...)
 {
+    AMB_UNUSED(file);
+    AMB_UNUSED(line);
     if (!g_log_cs_ready || level > g_log_level) return;
 
     SYSTEMTIME st;
@@ -128,9 +136,10 @@ void Log_Write(int level, const char* file, int line, const char* fmt, ...)
     }
 
     EnterCriticalSection(&g_log_cs);
-    if (g_log_file) {
-        fputs(linebuf, g_log_file);
-        if (level <= 2) fflush(g_log_file);
+    if (g_log_handle) {
+        DWORD written = 0;
+        WriteFile(g_log_handle, linebuf, (DWORD)(prefix + copy + 1), &written, NULL);
+        if (level <= 1) FlushFileBuffers(g_log_handle);
     }
     LeaveCriticalSection(&g_log_cs);
 }

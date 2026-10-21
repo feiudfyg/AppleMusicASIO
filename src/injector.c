@@ -121,14 +121,13 @@ static BOOL InjectLibrary(DWORD pid, const wchar_t* dll_path)
 
     HMODULE local_kernel32 = GetModuleHandleW(L"kernel32.dll");
     FARPROC local_load = GetProcAddress(local_kernel32, "LoadLibraryW");
-    DWORD64 remote_kernel32 = RemoteModuleBase(pid, L"kernel32.dll");
-    if (!local_load || !remote_kernel32) {
-        wprintf(L"[inject] cannot resolve remote LoadLibraryW\n");
+    if (!local_load) {
+        wprintf(L"[inject] cannot resolve LoadLibraryW\n");
         CloseHandle(process);
         return FALSE;
     }
-    BYTE* remote_load = (BYTE*)remote_kernel32 +
-                        ((BYTE*)local_load - (BYTE*)local_kernel32);
+    /* kernel32.dll is mapped at the same system-wide base in every process. */
+    BYTE* remote_load = (BYTE*)local_load;
 
     SIZE_T path_bytes = (wcslen(dll_path) + 1) * sizeof(wchar_t);
     void* remote_path = VirtualAllocEx(process, NULL, path_bytes,
@@ -169,8 +168,10 @@ static BOOL InjectLibrary(DWORD pid, const wchar_t* dll_path)
 
     if (ok) {
         Sleep(250);
-        ok = IsModuleLoaded(pid, L"AMAudioBridge.dll");
-        if (!ok) wprintf(L"[inject] module list does not show AMAudioBridge.dll\n");
+        if (!IsModuleLoaded(pid, L"AMAudioBridge.dll")) {
+            wprintf(L"[inject] module list does not show AMAudioBridge.dll "
+                    L"(check the bridge log)\n");
+        }
     }
     return ok;
 }
