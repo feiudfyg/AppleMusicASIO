@@ -260,6 +260,14 @@ int wmain(int argc, wchar_t** argv)
         return 1;
     }
 
+    wchar_t full_dll[MAX_PATH];
+    DWORD full_len = GetFullPathNameW(dll_path, MAX_PATH, full_dll, NULL);
+    if (full_len == 0 || full_len >= MAX_PATH) {
+        wprintf(L"cannot resolve bridge DLL path: %ls\n", dll_path);
+        return 1;
+    }
+    dll_path = full_dll;
+
     EnableDebugPrivilege();
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
