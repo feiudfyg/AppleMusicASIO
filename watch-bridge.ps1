@@ -14,6 +14,7 @@ if (-not $BridgeDir) {
 $ErrorActionPreference = 'SilentlyContinue'
 $injector = Join-Path $BridgeDir 'AMAudioBridgeInjector.exe'
 $bridge = Join-Path $BridgeDir 'AMAudioBridge.dll'
+$persist = Join-Path $BridgeDir 'AMPrefsPersist.dll'
 $log = Join-Path $BridgeDir 'AMAudioBridgeWatch.log'
 
 $mutex = New-Object System.Threading.Mutex($false, 'Local\AMAudioBridgeWatcher')
@@ -22,6 +23,10 @@ if (-not $mutex.WaitOne(0)) {
 }
 
 "watcher start $(Get-Date -Format o) bridge=$bridge" | Out-File $log -Append
+$fixer = Join-Path $PSScriptRoot 'fix-preferences-junction.ps1'
+if (Test-Path $fixer) {
+    & $fixer -Quiet *>> $log
+}
 $attempts = @{}
 
 while ($true) {
@@ -39,6 +44,10 @@ while ($true) {
 
         $output = (& $injector --dll $bridge --pid $agentPid 2>&1 | Out-String).Trim()
         $code = $LASTEXITCODE
+        if (Test-Path $persist) {
+            $persistOutput = (& $injector --dll $persist --pid $agentPid --force 2>&1 | Out-String).Trim()
+            $output = "$output`n$persistOutput"
+        }
         $attempts[$agentPid]++
         "$(Get-Date -Format o) pid=$agentPid attempt=$($attempts[$agentPid]) exit=$code $output" |
             Out-File $log -Append

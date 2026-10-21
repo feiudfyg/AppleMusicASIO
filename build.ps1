@@ -48,6 +48,12 @@ Build-Target 'asiotool' @('src\asiotool.c') ('/OUT:' + (Join-Path $out 'AMAsioTo
 Build-Target 'coreaudio' @('src\coreaudio_probe.c') ('/DLL /OUT:' + (Join-Path $out 'AMCoreAudioProbe.dll') +
     ' ole32.lib uuid.lib')
 
+Build-Target 'prefsprobe' @('src\prefs_probe.c') ('/DLL /OUT:' + (Join-Path $out 'AMPrefsProbe.dll') +
+    ' ole32.lib uuid.lib')
+
+Build-Target 'prefspersist' @('src\prefs_probe.c') ('/DLL /OUT:' + (Join-Path $out 'AMPrefsPersist.dll') +
+    ' ole32.lib uuid.lib')
+
 Build-Target 'injector' @('src\injector.c') ('/OUT:' + (Join-Path $out 'AMAudioBridgeInjector.exe') +
     ' ole32.lib uuid.lib advapi32.lib')
 

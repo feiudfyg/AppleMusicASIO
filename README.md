@@ -16,7 +16,7 @@ Tested with:
 - MiniFuse ASIO driver 1.091
 - 44.1 kHz and 96 kHz Apple Music content, including automatic rate switching
 
-Current version: `0.2.0`.
+Current version: `0.2.1`.
 
 ## Features
 
@@ -124,6 +124,31 @@ ASIO driver (MiniFuse, etc.)
 - ASIO callbacks consume the ring, convert/pack to the driver's native sample
   type, and signal the app's event. No Windows mixer or APO is in the path.
 
+## Settings persistence fix
+
+Newer Apple Music builds store preferences through Apple's CFPreferences layer.
+When the MSIX package data is redirected to another volume (for example
+`D:\WpSystem\...`), the app writes a temporary
+`AppleMusic.exe.plist.Xa...` / `AMPLibraryAgent.exe.plist.Xa...` file on that
+volume and then tries to commit it to
+`%APPDATA%\Apple Computer\Preferences` on `C:`. The cross-volume move fails and
+the app deletes the temporary file; the audio-quality setting reverts to AAC on
+the next launch.
+
+Two small pieces fix this:
+
+- `fix-preferences-junction.ps1` makes
+  `%APPDATA%\Apple Computer\Preferences` a junction to the package's real
+  preferences directory, so reads and writes resolve to the same volume.
+  `watch-bridge.ps1` runs it automatically at startup.
+- `AMPrefsPersist.dll` is injected into `AMPLibraryAgent.exe`. When the app writes
+  a temporary `.plist.Xa...` file, the helper copies it to the final `.plist`
+  before Apple Music deletes it. This keeps the saved quality even if
+  CFPreferences' own rename still fails.
+
+If the quality setting still resets after an Apple Music update or a package
+reset, run `fix-preferences-junction.ps1` manually and restart Apple Music once.
+
 ## Limitations
 
 - Apple Music's own decoder and any processing before `IAudioClient` remain in
@@ -134,9 +159,8 @@ ASIO driver (MiniFuse, etc.)
 - WASAPI exclusive depends on the endpoint accepting the exact format. Many USB
   interfaces only expose their ASIO path for this; use ASIO.
 - The app's audio-quality setting (AAC vs Lossless/Hi-Res) is controlled by
-  Apple Music and is not modified by this project. Some Apple Music builds reset
-  that setting on launch, especially after the audio process was force-killed.
-  The watcher does not kill the app; set the quality manually if needed.
+  Apple Music. The junction plus `AMPrefsPersist.dll` fix described above keeps
+  it across launches on the tested layout. The watcher does not kill the app.
 - Apple Music updates can change internal modules and break the hooks. Test
   after each app update.
 - This project does not bypass DRM or content protection.
