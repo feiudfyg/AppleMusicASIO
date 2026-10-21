@@ -5,6 +5,7 @@
 #include "sink.h"
 #include "asio_host.h"
 #include "asio_iface.h"
+#include "app_hooks.h"
 
 typedef HRESULT (STDMETHODCALLTYPE* PFN_Initialize)(IAudioClient*, AUDCLNT_SHAREMODE, DWORD,
                                                     REFERENCE_TIME, REFERENCE_TIME,
@@ -300,6 +301,36 @@ static ULONG STDMETHODCALLTYPE Hook_Release(IAudioClient* This)
     return refs;
 }
 
+static BOOL IsFloatFormat(const WAVEFORMATEX* w)
+{
+    if (!w) return FALSE;
+    if (w->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) return TRUE;
+    if (w->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+        w->cbSize >= sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)) {
+        static const GUID float_subtype = {
+            0x00000003, 0x0000, 0x0010,
+            {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+        const WAVEFORMATEXTENSIBLE* e = (const WAVEFORMATEXTENSIBLE*)w;
+        return IsEqualGUID(&e->SubFormat, &float_subtype);
+    }
+    return FALSE;
+}
+
+static BOOL IsSupportedSourceRate(uint32_t rate)
+{
+    switch (rate) {
+    case 44100:
+    case 48000:
+    case 88200:
+    case 96000:
+    case 176400:
+    case 192000:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
 static HRESULT STDMETHODCALLTYPE Hook_GetMixFormat(IAudioClient* This, WAVEFORMATEX** format)
 {
     VtblCtx* c = CtxForObj(This);
@@ -312,11 +343,25 @@ static HRESULT STDMETHODCALLTYPE Hook_GetMixFormat(IAudioClient* This, WAVEFORMA
     LogFormat("GetMixFormat (device)", *format);
     if (CurrentMode() == AMB_MODE_MONITOR || CurrentMode() == AMB_MODE_OFF) return hr;
 
-    /* Never replace the endpoint mix format here.  Apple Music probes the
-       device with short-lived clients and only accepts the real mix format;
-       opening ASIO or exclusive-mode planning in this path makes it retry
-       forever and can destabilise the endpoint.  The sink negotiates its
-       real format at Initialize. */
+    uint32_t source_rate = AppHooks_GetSourceRate();
+    if (g_cfg.follow_source_rate && CurrentMode() == AMB_MODE_ASIO && source_rate &&
+        (uint32_t)(*format)->nSamplesPerSec != source_rate &&
+        IsSupportedSourceRate(source_rate) && IsFloatFormat(*format)) {
+        DWORD bytes = sizeof(WAVEFORMATEX) + (*format)->cbSize;
+        WAVEFORMATEX* copy = (WAVEFORMATEX*)CoTaskMemAlloc(bytes);
+        if (copy) {
+            memcpy(copy, *format, bytes);
+            copy->nSamplesPerSec = source_rate;
+            copy->nAvgBytesPerSec = source_rate * copy->nBlockAlign;
+            LOGI("GetMixFormat: following source rate %u Hz (device was %u Hz)",
+                 source_rate, (unsigned)(*format)->nSamplesPerSec);
+            CoTaskMemFree(*format);
+            *format = copy;
+        }
+    }
+
+    /* Never open ASIO here.  Apple Music probes the device with short-lived
+       clients; the sink negotiates its real format at Initialize. */
     return hr;
 }
 
@@ -355,6 +400,14 @@ static HRESULT STDMETHODCALLTYPE Hook_IsFormatSupported(IAudioClient* This,
             if (closest) *closest = NULL;
             return S_OK;
         }
+    }
+
+    uint32_t source_rate = AppHooks_GetSourceRate();
+    if (!s && g_cfg.follow_source_rate && mode == AMB_MODE_ASIO &&
+        share == AUDCLNT_SHAREMODE_SHARED && format && source_rate &&
+        (uint32_t)format->nSamplesPerSec == source_rate && IsFloatFormat(format)) {
+        if (closest) *closest = NULL;
+        return S_OK;
     }
 
     return orig(This, share, format, closest);

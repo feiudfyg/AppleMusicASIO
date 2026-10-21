@@ -33,7 +33,7 @@ function Build-Target([string]$name, [string[]]$sources, [string]$linkArgs) {
 $dllSources = @(
     'src\bridge.c', 'src\log.c', 'src\config.c', 'src\format.c', 'src\ring.c',
     'src\asio_host.c', 'src\sink_asio.c', 'src\sink_wasapi.c', 'src\stream.c',
-    'src\hooks.c', 'src\guids.c'
+    'src\hooks.c', 'src\app_hooks.c', 'src\guids.c'
 )
 Build-Target 'bridge' $dllSources ('/DLL /OUT:' + (Join-Path $out 'AMAudioBridge.dll') +
     ' ole32.lib uuid.lib advapi32.lib propsys.lib shell32.lib')
@@ -43,6 +43,9 @@ Build-Target 'probe' $probeSources ('/OUT:' + (Join-Path $out 'AMAudioProbe.exe'
     ' ole32.lib uuid.lib')
 
 Build-Target 'asiotool' @('src\asiotool.c') ('/OUT:' + (Join-Path $out 'AMAsioTool.exe') +
+    ' ole32.lib uuid.lib')
+
+Build-Target 'coreaudio' @('src\coreaudio_probe.c') ('/DLL /OUT:' + (Join-Path $out 'AMCoreAudioProbe.dll') +
     ' ole32.lib uuid.lib')
 
 Build-Target 'injector' @('src\injector.c') ('/OUT:' + (Join-Path $out 'AMAudioBridgeInjector.exe') +

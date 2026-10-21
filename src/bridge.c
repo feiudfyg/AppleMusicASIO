@@ -2,6 +2,7 @@
 #include "log.h"
 #include "config.h"
 #include "hooks.h"
+#include "app_hooks.h"
 
 static HMODULE g_module = NULL;
 static HANDLE g_instance_event = NULL;
@@ -26,6 +27,8 @@ static DWORD WINAPI BridgeInitThread(void* param)
         LOGE("hook installation failed");
         return 0;
     }
+
+    AppHooks_Start(g_module);
 
     LOGI("bridge ready (%u.%u.%u)",
          AMB_VERSION_MAJOR, AMB_VERSION_MINOR, AMB_VERSION_PATCH);

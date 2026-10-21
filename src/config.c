@@ -11,7 +11,8 @@ AmbConfig g_cfg = {
     0,
     0,
     20,
-    10
+    10,
+    FALSE
 };
 
 static wchar_t g_ini_path[MAX_PATH] = L"";
@@ -67,6 +68,7 @@ void Config_Load(void)
 
     g_cfg.log_level = IniGetInt(L"Bridge", L"LogLevel", 2);
     g_cfg.strict_bitperfect = IniGetBool(L"Bridge", L"StrictBitPerfect", TRUE);
+    g_cfg.follow_source_rate = IniGetBool(L"Bridge", L"FollowSourceRate", FALSE);
 
     wchar_t volume[32];
     IniGetString(L"Bridge", L"VolumeControl", L"unity", volume, 32);
@@ -82,12 +84,13 @@ void Config_Load(void)
 
     Log_SetLevel(g_cfg.log_level);
     LOGI("config: %ls", g_ini_path[0] ? g_ini_path : L"(defaults)");
-    LOGI("config: mode=%s log=%d strict=%d volume=%s driver=%ls channels=%d buffer=%d rate=%d wasapi_buf=%dms",
+    LOGI("config: mode=%s log=%d strict=%d volume=%s driver=%ls channels=%d buffer=%d rate=%d wasapi_buf=%dms follow_source=%d",
          Config_ModeName(g_cfg.mode), g_cfg.log_level,
          g_cfg.strict_bitperfect ? 1 : 0,
          g_cfg.volume_control ? "app" : "unity",
          g_cfg.asio_driver, g_cfg.asio_channels, g_cfg.asio_buffer_frames,
-         g_cfg.asio_rate, g_cfg.wasapi_buffer_ms);
+         g_cfg.asio_rate, g_cfg.wasapi_buffer_ms,
+         g_cfg.follow_source_rate ? 1 : 0);
 
     WIN32_FILE_ATTRIBUTE_DATA fad;
     if (g_ini_path[0] && GetFileAttributesExW(g_ini_path, GetFileExInfoStandard, &fad)) {

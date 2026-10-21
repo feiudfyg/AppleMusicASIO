@@ -65,6 +65,8 @@ static BOOL IsModuleLoaded(DWORD pid, const wchar_t* module)
     return found;
 }
 
+static BOOL g_force_inject = FALSE;
+
 static BOOL IsBridgePresent(DWORD pid)
 {
     wchar_t name[64];
@@ -112,11 +114,10 @@ static BOOL IsTargetX64(HANDLE process)
 
 static BOOL InjectLibrary(DWORD pid, const wchar_t* dll_path)
 {
-    if (IsBridgePresent(pid)) {
+    if (!g_force_inject && IsBridgePresent(pid)) {
         wprintf(L"[inject] bridge already loaded in pid %lu\n", pid);
         return TRUE;
     }
-
     HANDLE process = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
                                  PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
                                  FALSE, pid);
@@ -251,6 +252,7 @@ int wmain(int argc, wchar_t** argv)
         else if (!_wcsicmp(argv[i], L"--name") && i + 1 < argc) process_name = argv[++i];
         else if (!_wcsicmp(argv[i], L"--launch")) launch = TRUE;
         else if (!_wcsicmp(argv[i], L"--watch")) watch = TRUE;
+        else if (!_wcsicmp(argv[i], L"--force")) g_force_inject = TRUE;
         else if (!_wcsicmp(argv[i], L"--list-asio")) { ListAsio(); return 0; }
         else {
             wprintf(L"usage: AMAudioBridgeInjector [--dll path] [--pid n | --name exe] "
