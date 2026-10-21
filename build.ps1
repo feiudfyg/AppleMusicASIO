@@ -1,3 +1,5 @@
+param([string]$OutputDir = 'bin\x64\Release')
+
 $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -8,8 +10,8 @@ if (!$vsPath) { throw "Visual Studio not found" }
 $vcvars = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'
 if (!(Test-Path $vcvars)) { throw "vcvars64.bat not found" }
 
-$out = Join-Path $root 'bin\x64\Release'
-$objRoot = Join-Path $root 'obj\x64\Release'
+$out = Join-Path $root $OutputDir
+$objRoot = Join-Path $root (Join-Path 'obj' $OutputDir)
 New-Item -ItemType Directory -Force $out | Out-Null
 New-Item -ItemType Directory -Force $objRoot | Out-Null
 

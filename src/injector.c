@@ -291,7 +291,7 @@ int wmain(int argc, wchar_t** argv)
             if (p && !IsModuleLoaded(p, L"AMAudioBridge.dll")) {
                 InjectLibrary(p, dll_path);
             }
-            Sleep(2000);
+            Sleep(100);
         }
     }
 
