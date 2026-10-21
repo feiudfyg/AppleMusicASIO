@@ -35,7 +35,7 @@
 #endif
 
 #define AMB_VERSION_MAJOR 0
-#define AMB_VERSION_MINOR 1
+#define AMB_VERSION_MINOR 2
 #define AMB_VERSION_PATCH 0
 
 #define AMB_MAX_STREAMS 16
