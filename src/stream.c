@@ -378,6 +378,191 @@ static IAudioStreamVolumeVtbl g_stream_volume_vtbl = {
 };
 
 /* ------------------------------------------------------------------ */
+/* Fake IAudioSessionControl / IAudioSessionControl2                   */
+/* ------------------------------------------------------------------ */
+
+typedef struct FakeSession {
+    IAudioSessionControl2Vtbl* lpVtbl;
+    LONG refs;
+    Stream* stream;
+} FakeSession;
+
+static HRESULT Session_QueryInterface(IAudioSessionControl2* This, REFIID riid, void** ppv)
+{
+    if (!ppv) return E_POINTER;
+    if (IsEqualIID(riid, &IID_IUnknown) ||
+        IsEqualIID(riid, &IID_IAudioSessionControl) ||
+        IsEqualIID(riid, &IID_IAudioSessionControl2)) {
+        *ppv = This;
+        This->lpVtbl->AddRef(This);
+        return S_OK;
+    }
+    *ppv = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG STDMETHODCALLTYPE Session_AddRef(IAudioSessionControl2* This)
+{
+    FakeSession* self = (FakeSession*)This;
+    return (ULONG)InterlockedIncrement(&self->refs);
+}
+
+static ULONG STDMETHODCALLTYPE Session_Release(IAudioSessionControl2* This)
+{
+    FakeSession* self = (FakeSession*)This;
+    LONG refs = InterlockedDecrement(&self->refs);
+    if (refs == 0) {
+        Stream* s = self->stream;
+        free(self);
+        Stream_Release(s);
+    }
+    return (ULONG)refs;
+}
+
+static HRESULT CoEmptyString(LPWSTR* out)
+{
+    if (!out) return E_POINTER;
+    wchar_t* p = (wchar_t*)CoTaskMemAlloc(sizeof(wchar_t));
+    if (!p) return E_OUTOFMEMORY;
+    p[0] = 0;
+    *out = p;
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE Session_GetState(IAudioSessionControl2* This,
+                                                  AudioSessionState* state)
+{
+    FakeSession* self = (FakeSession*)This;
+    if (!state) return E_POINTER;
+    *state = (self->stream && self->stream->started) ? AudioSessionStateActive
+                                                     : AudioSessionStateInactive;
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE Session_GetDisplayName(IAudioSessionControl2* This,
+                                                        LPWSTR* name)
+{
+    AMB_UNUSED(This);
+    return CoEmptyString(name);
+}
+
+static HRESULT STDMETHODCALLTYPE Session_SetDisplayName(IAudioSessionControl2* This,
+                                                        LPCWSTR name, LPCGUID ctx)
+{
+    AMB_UNUSED(This);
+    AMB_UNUSED(name);
+    AMB_UNUSED(ctx);
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE Session_GetIconPath(IAudioSessionControl2* This,
+                                                     LPWSTR* path)
+{
+    AMB_UNUSED(This);
+    return CoEmptyString(path);
+}
+
+static HRESULT STDMETHODCALLTYPE Session_SetIconPath(IAudioSessionControl2* This,
+                                                     LPCWSTR path, LPCGUID ctx)
+{
+    AMB_UNUSED(This);
+    AMB_UNUSED(path);
+    AMB_UNUSED(ctx);
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE Session_GetGroupingParam(IAudioSessionControl2* This,
+                                                          GUID* param)
+{
+    AMB_UNUSED(This);
+    if (!param) return E_POINTER;
+    ZeroMemory(param, sizeof(*param));
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE Session_SetGroupingParam(IAudioSessionControl2* This,
+                                                          LPCGUID param, LPCGUID ctx)
+{
+    AMB_UNUSED(This);
+    AMB_UNUSED(param);
+    AMB_UNUSED(ctx);
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE Session_Register(IAudioSessionControl2* This,
+                                                  IAudioSessionEvents* events)
+{
+    AMB_UNUSED(This);
+    AMB_UNUSED(events);
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE Session_Unregister(IAudioSessionControl2* This,
+                                                    IAudioSessionEvents* events)
+{
+    AMB_UNUSED(This);
+    AMB_UNUSED(events);
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE Session_GetSessionIdentifier(IAudioSessionControl2* This,
+                                                              LPWSTR* id)
+{
+    AMB_UNUSED(This);
+    return CoEmptyString(id);
+}
+
+static HRESULT STDMETHODCALLTYPE Session_GetSessionInstanceIdentifier(
+    IAudioSessionControl2* This, LPWSTR* id)
+{
+    AMB_UNUSED(This);
+    return CoEmptyString(id);
+}
+
+static HRESULT STDMETHODCALLTYPE Session_GetProcessId(IAudioSessionControl2* This,
+                                                      DWORD* pid)
+{
+    AMB_UNUSED(This);
+    if (!pid) return E_POINTER;
+    *pid = GetCurrentProcessId();
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE Session_IsSystemSoundsSession(IAudioSessionControl2* This)
+{
+    AMB_UNUSED(This);
+    return S_FALSE;
+}
+
+static HRESULT STDMETHODCALLTYPE Session_SetDuckingPreference(IAudioSessionControl2* This,
+                                                              BOOL opt_out)
+{
+    AMB_UNUSED(This);
+    AMB_UNUSED(opt_out);
+    return S_OK;
+}
+
+static IAudioSessionControl2Vtbl g_session_vtbl = {
+    Session_QueryInterface,
+    Session_AddRef,
+    Session_Release,
+    Session_GetState,
+    Session_GetDisplayName,
+    Session_SetDisplayName,
+    Session_GetIconPath,
+    Session_SetIconPath,
+    Session_GetGroupingParam,
+    Session_SetGroupingParam,
+    Session_Register,
+    Session_Unregister,
+    Session_GetSessionIdentifier,
+    Session_GetSessionInstanceIdentifier,
+    Session_GetProcessId,
+    Session_IsSystemSoundsSession,
+    Session_SetDuckingPreference
+};
+
+/* ------------------------------------------------------------------ */
 /* Stream table and lifetime                                           */
 /* ------------------------------------------------------------------ */
 
@@ -550,12 +735,13 @@ BOOL Stream_BeginFake(Stream* s, const AmbAudioFormat* fmt, int mode,
     s->fake = TRUE;
     s->initialized = TRUE;
     s->started = FALSE;
-    s->bitperfect = TRUE;
+    s->bitperfect = sink->bitperfect;
 
-    LOGI("bridge stream: %s, app buffer %lu frames (%lu bytes/frame), period %lu frames",
+    LOGI("bridge stream: %s, app buffer %lu frames (%lu bytes/frame), period %lu frames, %s",
          mode == AMB_MODE_ASIO ? "ASIO" : "WASAPI-exclusive",
          (unsigned long)s->ring.cap_frames, (unsigned long)fmt->frame_bytes,
-         (unsigned long)period);
+         (unsigned long)period,
+         s->bitperfect ? "bit-perfect" : "transparent conversion");
     LeaveCriticalSection(&s->lock);
     return TRUE;
 }
@@ -607,4 +793,16 @@ IAudioStreamVolume* Stream_GetStreamVolume(Stream* s)
     for (int i = 0; i < AMB_MAX_CHANNELS; ++i) fv->volumes[i] = 1.0f;
     Stream_AddRef(s);
     return (IAudioStreamVolume*)fv;
+}
+
+IAudioSessionControl2* Stream_GetSessionControl(Stream* s)
+{
+    if (!s) return NULL;
+    FakeSession* fs = (FakeSession*)calloc(1, sizeof(*fs));
+    if (!fs) return NULL;
+    fs->lpVtbl = &g_session_vtbl;
+    fs->refs = 1;
+    fs->stream = s;
+    Stream_AddRef(s);
+    return (IAudioSessionControl2*)fs;
 }

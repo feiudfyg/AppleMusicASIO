@@ -43,6 +43,22 @@ BOOL Asio_MapNativeFormat(long type, UINT32 rate, UINT32 channels, AmbAudioForma
     }
 }
 
+static BOOL Asio_TypeAllowsFloatConversion(long type)
+{
+    switch (type) {
+    case ASIOSTInt32LSB:
+    case ASIOSTInt32LSB24:
+    case ASIOSTInt32LSB20:
+    case ASIOSTInt32LSB18:
+    case ASIOSTInt32LSB16:
+    case ASIOSTInt24LSB:
+    case ASIOSTInt16LSB:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
 static HRESULT AsioSink_Open(AmbSink* base, Stream* stream, const AmbAudioFormat* fmt)
 {
     AsioSink* sink = (AsioSink*)base;
@@ -62,17 +78,27 @@ static HRESULT AsioSink_Open(AmbSink* base, Stream* stream, const AmbAudioFormat
 
     AmbAudioFormat native;
     if (!Asio_MapNativeFormat(sink->info.sample_type, fmt->rate, fmt->channels, &native)) {
-        LOGE("ASIO: unsupported sample type %s (%ld) for bit-perfect output",
+        LOGE("ASIO: unsupported sample type %s (%ld)",
              Asio_SampleTypeName(sink->info.sample_type), sink->info.sample_type);
         AsioHost_CloseStream();
         return E_FAIL;
     }
 
-    if (!Format_Equal(fmt, &native)) {
+    if (Format_Equal(fmt, &native)) {
+        base->bitperfect = TRUE;
+        LOGI("ASIO: bit-perfect path, app format matches driver format (%s)",
+             Asio_SampleTypeName(sink->info.sample_type));
+    } else if (fmt->is_float && fmt->bits == 32 &&
+               Asio_TypeAllowsFloatConversion(sink->info.sample_type)) {
+        base->bitperfect = FALSE;
+        LOGI("ASIO: float32 -> %s conversion (no resampling; 16/24-bit content is "
+             "reconstructed exactly)",
+             Asio_SampleTypeName(sink->info.sample_type));
+    } else {
         char want[128], have[128];
         Format_ToString(fmt, want, sizeof(want));
         Format_ToString(&native, have, sizeof(have));
-        LOGE("ASIO: app requested %s but the driver is native %s; refusing to convert",
+        LOGE("ASIO: app format %s cannot feed driver format %s without resampling",
              want, have);
         AsioHost_CloseStream();
         return E_FAIL;
@@ -98,6 +124,7 @@ static void AsioSink_SetRing(AmbSink* base, AmbRing* ring)
     consumer.mute = &s->mute;
     consumer.is_float = sink->fmt.is_float;
     consumer.volume_enabled = g_cfg.volume_control;
+    consumer.asio_type = sink->info.sample_type;
     AsioHost_SetConsumer(&consumer);
 
     LOGI("ASIO sink: %s, %lu frames, ring %lu frames, volume=%s",
@@ -116,6 +143,7 @@ static HRESULT AsioSink_Start(AmbSink* base)
 static void AsioSink_Stop(AmbSink* base)
 {
     AMB_UNUSED(base);
+    AsioHost_Stop();
     LONG64 frames = 0;
     LONG underruns = 0;
     AsioHost_GetStats(&frames, &underruns);
@@ -125,7 +153,6 @@ static void AsioSink_Stop(AmbSink* base)
     } else {
         LOGI("ASIO: stream stopped, %lld frames played", (long long)frames);
     }
-    AsioHost_Stop();
 }
 
 static void AsioSink_Close(AmbSink* base)

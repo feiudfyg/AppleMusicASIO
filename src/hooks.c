@@ -107,6 +107,17 @@ static AmbMode CurrentMode(void)
     return (AmbMode)InterlockedCompareExchange(&g_mode, AMB_MODE_AUTO, AMB_MODE_AUTO);
 }
 
+static void RefreshMode(void)
+{
+    if (!Config_ReloadIfChanged()) return;
+    AmbMode effective = g_cfg.mode;
+    if (effective == AMB_MODE_AUTO) {
+        effective = Asio_Available(g_cfg.asio_driver) ? AMB_MODE_ASIO : AMB_MODE_EXCLUSIVE;
+    }
+    InterlockedExchange(&g_mode, effective);
+    LOGI("effective mode now: %s", Config_ModeName(effective));
+}
+
 static VtblCtx* CtxForObj(void* obj)
 {
     if (!obj) return NULL;
@@ -239,41 +250,6 @@ static void InstallDeviceCtx(void** vtbl)
     LOGI("hooked IMMDevice::Activate at %p", (void*)vtbl[3]);
 }
 
-static BOOL BuildAsioPlan(const AmbAudioFormat* mix, AmbAudioFormat* out)
-{
-    UINT32 channels = g_cfg.asio_channels > 0 ? (UINT32)g_cfg.asio_channels : mix->channels;
-    double rates[3];
-    int count = 0;
-    if (g_cfg.asio_rate > 0) {
-        rates[count++] = (double)g_cfg.asio_rate;
-    } else {
-        rates[count++] = (double)mix->rate;
-        if (mix->rate != 48000) rates[count++] = 48000.0;
-        if (mix->rate != 44100) rates[count++] = 44100.0;
-    }
-
-    for (int i = 0; i < count; ++i) {
-        AsioFormatInfo info;
-        HRESULT hr = AsioHost_Probe(rates[i], (int)channels, g_cfg.asio_buffer_frames, &info);
-        if (FAILED(hr)) continue;
-        if (!Asio_MapNativeFormat(info.sample_type, (UINT32)info.rate,
-                                  (UINT32)info.channels, out)) {
-            LOGE("ASIO: cannot expose sample type %s", Asio_SampleTypeName(info.sample_type));
-            return FALSE;
-        }
-        char text[128];
-        Format_ToString(out, text, sizeof(text));
-        LOGI("ASIO plan: %s (%s), %ld frames", text,
-             Asio_SampleTypeName(info.sample_type), info.buffer_frames);
-        if (info.rate != (double)mix->rate) {
-            LOGW("ASIO: driver cannot run at %lu Hz, plan uses %.0f Hz; the app must resample",
-                 (unsigned long)mix->rate, info.rate);
-        }
-        return TRUE;
-    }
-    return FALSE;
-}
-
 static HRESULT BeginBridge(Stream* s, VtblCtx* c, const WAVEFORMATEX* pFormat)
 {
     AmbAudioFormat fmt;
@@ -286,7 +262,8 @@ static HRESULT BeginBridge(Stream* s, VtblCtx* c, const WAVEFORMATEX* pFormat)
     AmbMode mode = CurrentMode();
     if (mode == AMB_MODE_ASIO) {
         if (Stream_BeginFake(s, &fmt, AMB_MODE_ASIO, &fns)) {
-            LOGI("bridge: ASIO stream active (bit-perfect)");
+            LOGI("bridge: ASIO stream active (%s)",
+                 s->bitperfect ? "bit-perfect" : "transparent format conversion");
             return S_OK;
         }
         LOGW("bridge: ASIO setup failed, trying WASAPI exclusive");
@@ -294,7 +271,8 @@ static HRESULT BeginBridge(Stream* s, VtblCtx* c, const WAVEFORMATEX* pFormat)
     }
     if (mode == AMB_MODE_EXCLUSIVE) {
         if (Stream_BeginFake(s, &fmt, AMB_MODE_EXCLUSIVE, &fns)) {
-            LOGI("bridge: WASAPI exclusive stream active (bit-perfect)");
+            LOGI("bridge: WASAPI exclusive stream active (%s)",
+                 s->bitperfect ? "bit-perfect" : "transparent format conversion");
             return S_OK;
         }
     }
@@ -330,60 +308,15 @@ static HRESULT STDMETHODCALLTYPE Hook_GetMixFormat(IAudioClient* This, WAVEFORMA
     HRESULT hr = orig(This, format);
     if (FAILED(hr) || !format || !*format) return hr;
 
-    AmbMode mode = CurrentMode();
+    RefreshMode();
     LogFormat("GetMixFormat (device)", *format);
-    if (mode == AMB_MODE_MONITOR || mode == AMB_MODE_OFF) return hr;
+    if (CurrentMode() == AMB_MODE_MONITOR || CurrentMode() == AMB_MODE_OFF) return hr;
 
-    AmbAudioFormat mix;
-    if (!Format_Parse(&mix, *format)) {
-        LOGW("GetMixFormat: unsupported device format, passing through");
-        return hr;
-    }
-
-    if (mode == AMB_MODE_ASIO) {
-        AmbAudioFormat plan;
-        if (BuildAsioPlan(&mix, &plan)) {
-            WAVEFORMATEX* replacement = Format_AllocCo(&plan);
-            if (replacement) {
-                CoTaskMemFree(*format);
-                *format = replacement;
-                Stream* s = Stream_Get(This, TRUE);
-                if (s) {
-                    s->plan_fmt = plan;
-                    s->have_plan = TRUE;
-                }
-                return S_OK;
-            }
-        }
-        LOGW("GetMixFormat: ASIO unavailable, switching to WASAPI exclusive");
-        InterlockedExchange(&g_mode, AMB_MODE_EXCLUSIVE);
-        mode = AMB_MODE_EXCLUSIVE;
-    }
-
-    if (mode == AMB_MODE_EXCLUSIVE) {
-        RealClientFns fns = MakeFns(c);
-        AmbAudioFormat chosen;
-        if (Wasapi_PickExclusive(This, &fns, &mix, &chosen)) {
-            WAVEFORMATEX* replacement = Format_AllocCo(&chosen);
-            if (replacement) {
-                CoTaskMemFree(*format);
-                *format = replacement;
-                Stream* s = Stream_Get(This, TRUE);
-                if (s) {
-                    s->plan_fmt = chosen;
-                    s->have_plan = TRUE;
-                }
-                char text[128];
-                Format_ToString(&chosen, text, sizeof(text));
-                LOGI("exclusive plan: %s", text);
-                return S_OK;
-            }
-        }
-        LOGW("GetMixFormat: no exclusive format for this endpoint, shared mode will be used");
-        Stream* s = Stream_Get(This, TRUE);
-        if (s) s->have_plan = FALSE;
-    }
-
+    /* Never replace the endpoint mix format here.  Apple Music probes the
+       device with short-lived clients and only accepts the real mix format;
+       opening ASIO or exclusive-mode planning in this path makes it retry
+       forever and can destabilise the endpoint.  The sink negotiates its
+       real format at Initialize. */
     return hr;
 }
 
@@ -444,6 +377,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Initialize(IAudioClient* This, AUDCLNT_SHA
          (int)share, (unsigned long)flags, (long long)buffer_duration,
          (long long)periodicity, text);
 
+    RefreshMode();
     AmbMode mode = CurrentMode();
     if (mode == AMB_MODE_MONITOR || mode == AMB_MODE_OFF || !parsed) {
         return orig(This, share, flags, buffer_duration, periodicity, format, session);
@@ -592,6 +526,10 @@ static HRESULT STDMETHODCALLTYPE Hook_GetService(IAudioClient* This, REFIID riid
     if (!ppv) return E_POINTER;
 
     Stream* s = Stream_Get(This, FALSE);
+    wchar_t iid_text[64];
+    LogIid(riid, iid_text, 64);
+    LOGD("GetService %ls (fake=%d)", iid_text, s && s->fake);
+
     if (s && s->fake) {
         *ppv = NULL;
         if (IsEqualIID(riid, &IID_IAudioRenderClient)) {
@@ -614,8 +552,12 @@ static HRESULT STDMETHODCALLTYPE Hook_GetService(IAudioClient* This, REFIID riid
             if (!*ppv) return E_OUTOFMEMORY;
             return S_OK;
         }
-        wchar_t iid_text[64];
-        LogIid(riid, iid_text, 64);
+        if (IsEqualIID(riid, &IID_IAudioSessionControl) ||
+            IsEqualIID(riid, &IID_IAudioSessionControl2)) {
+            *ppv = Stream_GetSessionControl(s);
+            if (!*ppv) return E_OUTOFMEMORY;
+            return S_OK;
+        }
         LOGW("GetService(%ls) unsupported in bridge mode", iid_text);
         return E_NOINTERFACE;
     }
@@ -688,6 +630,7 @@ static HRESULT STDMETHODCALLTYPE Hook_GetCurrentSharedModeEnginePeriod(IAudioCli
     VtblCtx* c = CtxForObj(This);
     if (!c) return E_FAIL;
     Stream* s = Stream_Get(This, FALSE);
+    LOGD("GetCurrentSharedModeEnginePeriod (fake=%d)", s && s->fake);
     if (s && s->fake) {
         if (format) *format = Format_AllocCo(&s->app_fmt);
         if (frames) *frames = s->period_frames;

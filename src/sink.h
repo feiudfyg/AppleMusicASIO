@@ -10,6 +10,7 @@ typedef struct AmbSink {
     void (*Stop)(struct AmbSink* sink);
     void (*Close)(struct AmbSink* sink);
     uint32_t period_frames;
+    BOOL bitperfect;
 } AmbSink;
 
 BOOL Sink_AsioCreate(Stream* stream, const AmbAudioFormat* fmt, AmbSink** out_sink);

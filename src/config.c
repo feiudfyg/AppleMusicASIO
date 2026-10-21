@@ -15,6 +15,9 @@ AmbConfig g_cfg = {
 };
 
 static wchar_t g_ini_path[MAX_PATH] = L"";
+static FILETIME g_ini_write_time;
+static DWORD g_last_reload_check = 0;
+static BOOL g_ini_has_time = FALSE;
 
 static void IniGetString(const wchar_t* section, const wchar_t* key,
                          const wchar_t* def, wchar_t* out, DWORD count)
@@ -85,6 +88,30 @@ void Config_Load(void)
          g_cfg.volume_control ? "app" : "unity",
          g_cfg.asio_driver, g_cfg.asio_channels, g_cfg.asio_buffer_frames,
          g_cfg.asio_rate, g_cfg.wasapi_buffer_ms);
+
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (g_ini_path[0] && GetFileAttributesExW(g_ini_path, GetFileExInfoStandard, &fad)) {
+        g_ini_write_time = fad.ftLastWriteTime;
+        g_ini_has_time = TRUE;
+    } else {
+        g_ini_has_time = FALSE;
+    }
+}
+
+BOOL Config_ReloadIfChanged(void)
+{
+    DWORD now = GetTickCount();
+    if (now - g_last_reload_check < 1000) return FALSE;
+    g_last_reload_check = now;
+    if (!g_ini_path[0] || !g_ini_has_time) return FALSE;
+
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExW(g_ini_path, GetFileExInfoStandard, &fad)) return FALSE;
+    if (CompareFileTime(&fad.ftLastWriteTime, &g_ini_write_time) == 0) return FALSE;
+
+    LOGI("config changed on disk, reloading");
+    Config_Load();
+    return TRUE;
 }
 
 const char* Config_ModeName(AmbMode mode)

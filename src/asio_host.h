@@ -27,6 +27,7 @@ typedef struct AsioConsumer {
     volatile BOOL* mute;
     BOOL is_float;
     BOOL volume_enabled;
+    long asio_type;
 } AsioConsumer;
 
 int Asio_EnumDrivers(AsioDriverInfo* out, int max_count);

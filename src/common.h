@@ -11,6 +11,7 @@
 #include <objbase.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
+#include <audiopolicy.h>
 #include <mmreg.h>
 #include <propsys.h>
 #include <stdint.h>

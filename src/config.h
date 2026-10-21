@@ -18,4 +18,5 @@ typedef struct AmbConfig {
 extern AmbConfig g_cfg;
 
 void Config_Load(void);
+BOOL Config_ReloadIfChanged(void);
 const char* Config_ModeName(AmbMode mode);

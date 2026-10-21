@@ -608,6 +608,43 @@ void AsioHost_GetStats(LONG64* frames, LONG* underruns)
     if (underruns) *underruns = g_asio.underruns;
 }
 
+static uint32_t AsioBytesPerSample(long type)
+{
+    switch (type) {
+    case ASIOSTInt16LSB:
+    case ASIOSTInt16MSB:
+        return 2;
+    case ASIOSTInt24LSB:
+    case ASIOSTInt24MSB:
+        return 3;
+    case ASIOSTFloat64LSB:
+    case ASIOSTFloat64MSB:
+        return 8;
+    default:
+        return 4;
+    }
+}
+
+/* Invert the conventional integer -> float mapping (s / 2^(bits-1)) exactly.
+   This keeps 16/24-bit content bit-transparent when a float32 stream has to be
+   packed into an integer ASIO buffer. */
+static int32_t FloatToSigned(float v, int bits)
+{
+    double scale = ldexp(1.0, bits - 1);
+    double x = (double)v * scale;
+    if (x >= scale - 1.0) return (int32_t)(scale - 1.0);
+    if (x <= -scale) return (int32_t)(-scale);
+    return (int32_t)llrint(x);
+}
+
+static void WritePacked24(uint8_t* dst, int32_t s)
+{
+    uint32_t u = (uint32_t)s & 0x00FFFFFFu;
+    dst[0] = (uint8_t)u;
+    dst[1] = (uint8_t)(u >> 8);
+    dst[2] = (uint8_t)(u >> 16);
+}
+
 static void Asio_BufferSwitch(long index, ASIOBool direct)
 {
     AMB_UNUSED(direct);
@@ -616,16 +653,14 @@ static void Asio_BufferSwitch(long index, ASIOBool direct)
     AsioConsumer* c = &g_asio.consumer;
     long frames = g_asio.buffer_frames;
     long channels = g_asio.channels;
+    uint32_t asio_bytes = AsioBytesPerSample(g_asio.sample_type);
 
     if (!g_asio.running || !g_asio.have_buffers || !c->ring || !c->ring->data ||
         !g_asio.scratch || channels <= 0) {
         for (long ch = 0; ch < channels; ++ch) {
             if (g_asio.bufs[ch].buffers[index]) {
                 memset(g_asio.bufs[ch].buffers[index], 0,
-                       (size_t)frames * (size_t)(g_asio.sample_type == ASIOSTInt24LSB ? 3 :
-                                                  g_asio.sample_type == ASIOSTInt16LSB ? 2 :
-                                                  g_asio.sample_type == ASIOSTInt24MSB ? 3 :
-                                                  g_asio.sample_type == ASIOSTInt16MSB ? 2 : 4));
+                       (size_t)frames * (size_t)asio_bytes);
             }
         }
         return;
@@ -634,8 +669,8 @@ static void Asio_BufferSwitch(long index, ASIOBool direct)
     uint32_t frame_bytes = c->frame_bytes;
     uint32_t app_channels = c->channels;
     if (frame_bytes == 0 || app_channels == 0) return;
-    uint32_t bytes_per_sample = frame_bytes / app_channels;
-    if (bytes_per_sample == 0) return;
+    uint32_t app_bytes = frame_bytes / app_channels;
+    if (app_bytes == 0) return;
 
     uint32_t fill = Ring_Fill(c->ring);
     uint32_t want = (uint32_t)frames;
@@ -649,45 +684,81 @@ static void Asio_BufferSwitch(long index, ASIOBool direct)
 
     BOOL mute = c->mute ? *c->mute : FALSE;
     float gain = c->gain ? *c->gain : 1.0f;
-    BOOL apply_gain = c->volume_enabled && c->is_float && (mute || fabsf(gain - 1.0f) > 1e-7f);
+    BOOL apply_gain = c->volume_enabled && c->is_float &&
+                      (mute || fabsf(gain - 1.0f) > 1e-7f);
+    BOOL convert = c->is_float && c->asio_type != ASIOSTFloat32LSB;
 
     long copy_channels = channels < (long)app_channels ? channels : (long)app_channels;
     for (long ch = 0; ch < copy_channels; ++ch) {
         uint8_t* dst = (uint8_t*)g_asio.bufs[ch].buffers[index];
         if (!dst) continue;
-        const uint8_t* src = g_asio.scratch + (size_t)ch * bytes_per_sample;
-        if (bytes_per_sample == 4) {
-            uint32_t* d = (uint32_t*)dst;
-            for (long i = 0; i < frames; ++i) {
-                memcpy(&d[i], src + (size_t)i * frame_bytes, 4);
+
+        if (mute) {
+            memset(dst, 0, (size_t)frames * (size_t)asio_bytes);
+            continue;
+        }
+
+        if (convert) {
+            if (app_bytes != 4) {
+                memset(dst, 0, (size_t)frames * (size_t)asio_bytes);
+                continue;
             }
-        } else if (bytes_per_sample == 3) {
             for (long i = 0; i < frames; ++i) {
-                memcpy(dst + (size_t)i * 3, src + (size_t)i * frame_bytes, 3);
+                float v = ((const float*)(g_asio.scratch + (size_t)i * frame_bytes))[ch];
+                if (apply_gain) v *= gain;
+                switch (c->asio_type) {
+                case ASIOSTInt32LSB:
+                    ((int32_t*)dst)[i] = FloatToSigned(v, 32);
+                    break;
+                case ASIOSTInt32LSB24:
+                    ((int32_t*)dst)[i] = (int32_t)((uint32_t)FloatToSigned(v, 24) << 8);
+                    break;
+                case ASIOSTInt32LSB20:
+                    ((int32_t*)dst)[i] = (int32_t)((uint32_t)FloatToSigned(v, 20) << 12);
+                    break;
+                case ASIOSTInt32LSB18:
+                    ((int32_t*)dst)[i] = (int32_t)((uint32_t)FloatToSigned(v, 18) << 14);
+                    break;
+                case ASIOSTInt32LSB16:
+                    ((int32_t*)dst)[i] = (int32_t)((uint32_t)FloatToSigned(v, 16) << 16);
+                    break;
+                case ASIOSTInt24LSB:
+                    WritePacked24(dst + (size_t)i * 3, FloatToSigned(v, 24));
+                    break;
+                case ASIOSTInt16LSB:
+                    ((int16_t*)dst)[i] = (int16_t)FloatToSigned(v, 16);
+                    break;
+                default:
+                    memset(dst + (size_t)i * asio_bytes, 0, asio_bytes);
+                    break;
+                }
+            }
+        } else if (app_bytes == asio_bytes) {
+            const uint8_t* src = g_asio.scratch + (size_t)ch * app_bytes;
+            for (long i = 0; i < frames; ++i) {
+                memcpy(dst + (size_t)i * asio_bytes,
+                       src + (size_t)i * frame_bytes, asio_bytes);
+            }
+            if (apply_gain) {
+                float* d = (float*)dst;
+                for (long i = 0; i < frames; ++i) d[i] *= gain;
             }
         } else {
-            uint16_t* d = (uint16_t*)dst;
-            for (long i = 0; i < frames; ++i) {
-                memcpy(&d[i], src + (size_t)i * frame_bytes, 2);
-            }
-        }
-        if (apply_gain) {
-            float* d = (float*)dst;
-            for (long i = 0; i < frames; ++i) {
-                d[i] = mute ? 0.0f : d[i] * gain;
-            }
+            memset(dst, 0, (size_t)frames * (size_t)asio_bytes);
         }
     }
+
     for (long ch = copy_channels; ch < channels; ++ch) {
         if (g_asio.bufs[ch].buffers[index]) {
             memset(g_asio.bufs[ch].buffers[index], 0,
-                   (size_t)frames * (size_t)bytes_per_sample);
+                   (size_t)frames * (size_t)asio_bytes);
         }
     }
 
     if (c->frames_played) {
         InterlockedExchangeAdd64(c->frames_played, (LONG64)got);
     }
+    InterlockedExchangeAdd64(&g_asio.frames_played, (LONG64)got);
     if (c->event && *c->event) {
         SetEvent(*c->event);
     }

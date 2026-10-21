@@ -4,12 +4,18 @@
 #include "hooks.h"
 
 static HMODULE g_module = NULL;
+static HANDLE g_instance_event = NULL;
 
 static DWORD WINAPI BridgeInitThread(void* param)
 {
     AMB_UNUSED(param);
     Log_Init(g_module);
     Config_Load();
+
+    wchar_t event_name[64];
+    _snwprintf_s(event_name, 64, _TRUNCATE, L"Local\\AMAudioBridge_%lu",
+                 (unsigned long)GetCurrentProcessId());
+    g_instance_event = CreateEventW(NULL, TRUE, FALSE, event_name);
 
     if (g_cfg.mode == AMB_MODE_OFF) {
         LOGI("bridge disabled by configuration");

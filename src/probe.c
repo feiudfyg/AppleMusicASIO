@@ -18,15 +18,24 @@ static int Run(int argc, wchar_t** argv)
     double amplitude = 0.03;
     int silent = 0;
     int use_exclusive = 0;
+    int force_float32 = 0;
+    int no_mix = 0;
+    UINT32 force_rate = 0;
+    UINT32 force_channels = 2;
 
     for (int i = 1; i < argc; ++i) {
         if (!_wcsicmp(argv[i], L"--load") && i + 1 < argc) dll_path = argv[++i];
         else if (!_wcsicmp(argv[i], L"--seconds") && i + 1 < argc) seconds = _wtoi(argv[++i]);
         else if (!_wcsicmp(argv[i], L"--amplitude") && i + 1 < argc) amplitude = _wtof(argv[++i]);
+        else if (!_wcsicmp(argv[i], L"--rate") && i + 1 < argc) force_rate = (UINT32)_wtoi(argv[++i]);
+        else if (!_wcsicmp(argv[i], L"--channels") && i + 1 < argc) force_channels = (UINT32)_wtoi(argv[++i]);
         else if (!_wcsicmp(argv[i], L"--silent")) silent = 1;
         else if (!_wcsicmp(argv[i], L"--exclusive")) use_exclusive = 1;
+        else if (!_wcsicmp(argv[i], L"--float32")) force_float32 = 1;
+        else if (!_wcsicmp(argv[i], L"--no-mix")) no_mix = 1;
         else {
-            printf("usage: AMAudioProbe [--load dll] [--seconds n] [--amplitude x] [--silent] [--exclusive]\n");
+            printf("usage: AMAudioProbe [--load dll] [--seconds n] [--amplitude x] [--silent]\n"
+                   "                   [--exclusive] [--float32] [--no-mix] [--rate hz] [--channels n]\n");
             return 2;
         }
     }
@@ -78,18 +87,29 @@ static int Run(int argc, wchar_t** argv)
     }
 
     WAVEFORMATEX* mix = NULL;
-    hr = client->lpVtbl->GetMixFormat(client, &mix);
-    if (FAILED(hr) || !mix) {
-        printf("GetMixFormat failed: 0x%08lx\n", (unsigned long)hr);
-        return 1;
-    }
-    PrintFormat("mix format", mix);
-
     AmbAudioFormat fmt;
-    if (!Format_Parse(&fmt, mix)) {
-        printf("unsupported mix format\n");
-        return 1;
+    if (no_mix) {
+        Format_Make(&fmt, force_rate ? force_rate : 48000, force_channels,
+                    AMB_SAMPLE_F32, 32);
+        printf("skipping GetMixFormat (Apple-style explicit format)\n");
+    } else {
+        hr = client->lpVtbl->GetMixFormat(client, &mix);
+        if (FAILED(hr) || !mix) {
+            printf("GetMixFormat failed: 0x%08lx\n", (unsigned long)hr);
+            return 1;
+        }
+        PrintFormat("mix format", mix);
+        if (!Format_Parse(&fmt, mix)) {
+            printf("unsupported mix format\n");
+            return 1;
+        }
+        if (force_float32) {
+            Format_Make(&fmt, force_rate ? force_rate : fmt.rate,
+                        force_channels ? force_channels : fmt.channels,
+                        AMB_SAMPLE_F32, 32);
+        }
     }
+    PrintFormat("app format", &fmt.wfx.Format);
 
     REFERENCE_TIME def_period = 0, min_period = 0;
     client->lpVtbl->GetDevicePeriod(client, &def_period, &min_period);
@@ -100,7 +120,7 @@ static int Run(int argc, wchar_t** argv)
     AUDCLNT_SHAREMODE share = use_exclusive ? AUDCLNT_SHAREMODE_EXCLUSIVE
                                             : AUDCLNT_SHAREMODE_SHARED;
     hr = client->lpVtbl->Initialize(client, share, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                                    10000000, 0, mix, NULL);
+                                    10000000, 0, &fmt.wfx.Format, NULL);
     printf("Initialize(share=%d): 0x%08lx\n", (int)share, (unsigned long)hr);
     if (FAILED(hr)) {
         return 1;

@@ -227,6 +227,7 @@ static HRESULT WasapiSink_Open(AmbSink* base, Stream* stream, const AmbAudioForm
 
     sink->frames = frames;
     base->period_frames = frames;
+    base->bitperfect = TRUE;
 
     char text[128];
     Format_ToString(fmt, text, sizeof(text));

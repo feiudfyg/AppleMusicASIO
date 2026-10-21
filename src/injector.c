@@ -65,6 +65,19 @@ static BOOL IsModuleLoaded(DWORD pid, const wchar_t* module)
     return found;
 }
 
+static BOOL IsBridgePresent(DWORD pid)
+{
+    wchar_t name[64];
+    _snwprintf_s(name, 64, _TRUNCATE, L"Local\\AMAudioBridge_%lu", (unsigned long)pid);
+    HANDLE event = OpenEventW(SYNCHRONIZE, FALSE, name);
+    if (event) {
+        CloseHandle(event);
+        return TRUE;
+    }
+    /* Older builds or a process that is still initialising. */
+    return IsModuleLoaded(pid, L"AMAudioBridge.dll");
+}
+
 static DWORD64 RemoteModuleBase(DWORD pid, const wchar_t* module)
 {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
@@ -99,7 +112,7 @@ static BOOL IsTargetX64(HANDLE process)
 
 static BOOL InjectLibrary(DWORD pid, const wchar_t* dll_path)
 {
-    if (IsModuleLoaded(pid, L"AMAudioBridge.dll")) {
+    if (IsBridgePresent(pid)) {
         wprintf(L"[inject] bridge already loaded in pid %lu\n", pid);
         return TRUE;
     }
@@ -168,7 +181,7 @@ static BOOL InjectLibrary(DWORD pid, const wchar_t* dll_path)
 
     if (ok) {
         Sleep(250);
-        if (!IsModuleLoaded(pid, L"AMAudioBridge.dll")) {
+        if (!IsBridgePresent(pid)) {
             wprintf(L"[inject] module list does not show AMAudioBridge.dll "
                     L"(check the bridge log)\n");
         }
@@ -296,7 +309,7 @@ int wmain(int argc, wchar_t** argv)
         wprintf(L"watching for %ls...\n", process_name);
         for (;;) {
             DWORD p = FindProcessByName(process_name, GetCurrentProcessId());
-            if (p && !IsModuleLoaded(p, L"AMAudioBridge.dll")) {
+            if (p && !IsBridgePresent(p)) {
                 InjectLibrary(p, dll_path);
             }
             Sleep(100);

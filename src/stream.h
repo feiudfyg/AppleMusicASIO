@@ -70,3 +70,4 @@ IAudioRenderClient* Stream_GetRenderClient(Stream* s);
 IAudioClock* Stream_GetClock(Stream* s);
 ISimpleAudioVolume* Stream_GetVolume(Stream* s);
 IAudioStreamVolume* Stream_GetStreamVolume(Stream* s);
+IAudioSessionControl2* Stream_GetSessionControl(Stream* s);
