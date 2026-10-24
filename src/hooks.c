@@ -344,7 +344,9 @@ static HRESULT STDMETHODCALLTYPE Hook_GetMixFormat(IAudioClient* This, WAVEFORMA
     if (CurrentMode() == AMB_MODE_MONITOR || CurrentMode() == AMB_MODE_OFF) return hr;
 
     uint32_t source_rate = AppHooks_GetSourceRate();
-    if (g_cfg.follow_source_rate && CurrentMode() == AMB_MODE_ASIO && source_rate &&
+    AmbMode mode = CurrentMode();
+    if (g_cfg.follow_source_rate &&
+        (mode == AMB_MODE_ASIO || mode == AMB_MODE_EXCLUSIVE) && source_rate &&
         (uint32_t)(*format)->nSamplesPerSec != source_rate &&
         IsSupportedSourceRate(source_rate) && IsFloatFormat(*format)) {
         DWORD bytes = sizeof(WAVEFORMATEX) + (*format)->cbSize;
@@ -720,6 +722,13 @@ static HRESULT STDMETHODCALLTYPE Hook_InitializeSharedAudioStream(IAudioClient* 
     LOGW("InitializeSharedAudioStream bridge failed; falling back");
     return ((PFN_InitializeSharedAudioStream)c->orig[20])(This, flags, period_frames, format,
                                                          session);
+}
+
+HRESULT Hooks_ActivateDevice(IMMDevice* device, REFIID iid, DWORD clsctx,
+                             PROPVARIANT* params, void** out)
+{
+    if (!g_device_activate_orig) return E_FAIL;
+    return g_device_activate_orig(device, iid, clsctx, params, out);
 }
 
 static HRESULT STDMETHODCALLTYPE Hook_Activate(IMMDevice* This, REFIID iid, DWORD clsctx,

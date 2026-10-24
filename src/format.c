@@ -57,7 +57,6 @@ void Format_Make(AmbAudioFormat* f, UINT32 rate, UINT32 channels,
     w->Format.nAvgBytesPerSec = rate * f->frame_bytes;
     w->Format.cbSize = 22;
     w->Samples.wValidBitsPerSample = (WORD)f->valid_bits;
-    w->Samples.wReserved = 0;
 
     switch (channels) {
     case 1:
