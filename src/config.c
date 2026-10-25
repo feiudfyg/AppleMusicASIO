@@ -19,6 +19,38 @@ static wchar_t g_ini_path[MAX_PATH] = L"";
 static FILETIME g_ini_write_time;
 static DWORD g_last_reload_check = 0;
 static BOOL g_ini_has_time = FALSE;
+static AmbMode g_ini_mode = AMB_MODE_AUTO;
+static AmbMode g_registry_mode = AMB_MODE_AUTO;
+static BOOL g_registry_mode_valid = FALSE;
+
+static AmbMode ParseMode(const wchar_t* mode)
+{
+    if (!_wcsicmp(mode, L"asio")) return AMB_MODE_ASIO;
+    if (!_wcsicmp(mode, L"exclusive") || !_wcsicmp(mode, L"wasapi")) {
+        return AMB_MODE_EXCLUSIVE;
+    }
+    if (!_wcsicmp(mode, L"monitor")) return AMB_MODE_MONITOR;
+    if (!_wcsicmp(mode, L"off")) return AMB_MODE_OFF;
+    return AMB_MODE_AUTO;
+}
+
+static BOOL ReadRegistryMode(AmbMode* out)
+{
+    HKEY key = NULL;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\AppleMusicASIO", 0,
+                      KEY_READ | KEY_WOW64_64KEY, &key) != ERROR_SUCCESS) {
+        return FALSE;
+    }
+    wchar_t text[32];
+    DWORD bytes = sizeof(text);
+    DWORD type = 0;
+    LONG rc = RegQueryValueExW(key, L"Mode", NULL, &type, (BYTE*)text, &bytes);
+    RegCloseKey(key);
+    if (rc != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ)) return FALSE;
+    text[(sizeof(text) / sizeof(text[0])) - 1] = 0;
+    *out = ParseMode(text);
+    return TRUE;
+}
 
 static void IniGetString(const wchar_t* section, const wchar_t* key,
                          const wchar_t* def, wchar_t* out, DWORD count)
@@ -60,11 +92,10 @@ void Config_Load(void)
 
     wchar_t mode[32];
     IniGetString(L"Bridge", L"Mode", L"auto", mode, 32);
-    if (!_wcsicmp(mode, L"asio")) g_cfg.mode = AMB_MODE_ASIO;
-    else if (!_wcsicmp(mode, L"exclusive") || !_wcsicmp(mode, L"wasapi")) g_cfg.mode = AMB_MODE_EXCLUSIVE;
-    else if (!_wcsicmp(mode, L"monitor")) g_cfg.mode = AMB_MODE_MONITOR;
-    else if (!_wcsicmp(mode, L"off")) g_cfg.mode = AMB_MODE_OFF;
-    else g_cfg.mode = AMB_MODE_AUTO;
+    g_ini_mode = ParseMode(mode);
+    g_cfg.mode = g_ini_mode;
+    g_registry_mode_valid = ReadRegistryMode(&g_registry_mode);
+    if (g_registry_mode_valid) g_cfg.mode = g_registry_mode;
 
     g_cfg.log_level = IniGetInt(L"Bridge", L"LogLevel", 2);
     g_cfg.strict_bitperfect = IniGetBool(L"Bridge", L"StrictBitPerfect", TRUE);
@@ -106,6 +137,22 @@ BOOL Config_ReloadIfChanged(void)
     DWORD now = GetTickCount();
     if (now - g_last_reload_check < 1000) return FALSE;
     g_last_reload_check = now;
+
+    AmbMode registry_mode = AMB_MODE_AUTO;
+    BOOL has_registry = ReadRegistryMode(&registry_mode);
+    if (has_registry != g_registry_mode_valid ||
+        (has_registry && registry_mode != g_registry_mode)) {
+        g_registry_mode_valid = has_registry;
+        if (has_registry) {
+            g_registry_mode = registry_mode;
+            g_cfg.mode = registry_mode;
+        } else {
+            g_cfg.mode = g_ini_mode;
+        }
+        LOGI("config: registry mode now %s", Config_ModeName(g_cfg.mode));
+        return TRUE;
+    }
+
     if (!g_ini_path[0] || !g_ini_has_time) return FALSE;
 
     WIN32_FILE_ATTRIBUTE_DATA fad;
