@@ -14,9 +14,14 @@ render stream remain in the path. DRM is not bypassed.
 - Source sample rate following: 44.1, 48, 96 and 192 kHz.
 - Automatic start with the normal Apple Music shortcut; no service, scheduled
   task, watcher or launcher process.
-- Minimal verifier shim for early agent startup; the audio bridge stays outside
-  System32 and loads through `MMDeviceEnumerator`.
-- Small per-user bridge installation in `%LOCALAPPDATA%\AppleMusicASIO`.
+- One elevated installer. It installs the Application Verifier shim and the
+  audio bridge; no separate verifier helper program.
+- The verifier shim loads the bridge only in `AMPLibraryAgent.exe`; no verifier
+  is attached to the UI process.
+- No COM hijack. The bridge is loaded only by the verifier shim inside the
+  Apple Music package.
+- The bridge is installed in protected `%ProgramFiles%\AppleMusicASIO`; its
+  SHA-256 is compiled into the shim and checked before loading.
 - Static C runtime and no Visual C++ redistributable.
 - Simple installer with an ASIO / WASAPI-exclusive mode selector.
 
@@ -25,54 +30,47 @@ and both output modes. Other drivers and Apple Music versions are untested.
 
 ## Install
 
-The verifier shim is machine-wide and needs administrator approval. The audio
-bridge is per-user.
+The installer is machine-wide and requires administrator approval.
 
 1. Close Apple Music.
-2. Open an elevated Command Prompt or PowerShell in the release folder and run:
+2. Run `AMAudioBridgeSetup.exe` from the release folder. Approve the UAC prompt.
+3. Select `WASAPI exclusive` or `ASIO`, click `Install`, then start Apple Music.
 
-   ```text
-   AMVerifierSetup.exe install
-   ```
+The installer:
 
-   This copies `AMVerifierShim.dll` to `%ProgramFiles%\AppleMusicASIO`, creates a
-   hard link in `System32`, and configures the Apple Music IFEO entry. It
-   refuses to overwrite another verifier provider.
-3. Run `AMAudioBridgeSetup.exe`, select `WASAPI exclusive` or `ASIO`, click
-   `Install`, then start Apple Music.
+- Copies `AMVerifierShim.dll`, `AMAudioBridge.dll`, `AMPrefsPersist.dll` and
+  `AMAudioBridge.ini` to `%ProgramFiles%\AppleMusicASIO`.
+- Creates a hard link to the shim in `System32` and configures the Application
+  Verifier IFEO entry for `AMPLibraryAgent.exe` only.
+- Protects the Program Files directory with an administrator-only write ACL.
+- Removes old `AppleMusic.exe` verifier, per-user early proxy and
+  `MMDeviceEnumerator` COM registrations during migration.
+- Stores the selected mode in
+  `HKCU\Software\AppleMusicASIO\Mode`.
 
 `Apply` saves a mode change and closes the window. `Close` discards the change.
 Restart Apple Music after changing the mode.
 
-The audio setup copies the bridge and preferences helper to
-`%LOCALAPPDATA%\AppleMusicASIO` and registers the per-user `MMDeviceEnumerator`
-COM server. It removes the old per-user early-launch proxy during migration.
-Administrator access is not required for this step.
-
 To uninstall, close Apple Music, run `AMAudioBridgeSetup.exe` and click
-`Uninstall`, then run `AMVerifierSetup.exe uninstall` from an elevated prompt.
-The preferences junction, if created, is kept because it also fixes Apple
-Music's own settings persistence.
+`Uninstall`. The preferences junction, if created, is kept because it also fixes
+Apple Music's settings persistence.
 
 ## Security model
 
-`AMVerifierShim.dll` is intentionally minimal:
+`AMVerifierShim.dll` is intentionally small:
 
-- It only calls `CoCreateInstance` for Apple's library class. It does not load
-  an audio DLL, read configuration, use the network, or inject into a process by
-  name.
-- It verifies the current package family and does nothing outside Apple Music.
-  The IFEO key is name-based, so a fake `AppleMusic.exe` is rejected by the shim.
-- The System32 entry is a hard link to an administrator-protected Program Files
-  file. The directory ACL grants users read/execute only; users cannot replace
-  the shim.
-- The verifier shim starts `AMPLibraryAgent.exe`; the agent then loads the audio
-  bridge normally through `MMDeviceEnumerator`.
-
-`AMVerifierSetup.exe` requires administrator privileges. It backs up the
-original IFEO values, refuses to overwrite a different `VerifierDlls` value,
-checks file hashes during uninstall, and never creates a System32 symlink to a
-user-writable path.
+- It verifies the current package family and does nothing outside the Apple
+  Music package. The IFEO key is name-based, so a fake `AMPLibraryAgent.exe` is
+  rejected by the package check.
+- It loads `AMAudioBridge.dll` in `AMPLibraryAgent.exe` only after checking the
+  file's compile-time SHA-256. There is no UI-process verifier, no COM
+  registration, no remote thread injection and no process-name injection.
+- The bridge and shim live in an administrator-protected directory. The
+  System32 entry is a hard link, not a symlink to a user-writable path. The
+  directory ACL grants users read/execute only.
+- The installer backs up the original IFEO values, refuses to overwrite another
+  `VerifierDlls` provider, verifies hashes during uninstall, and restores the
+  original values.
 
 A machine-wide IFEO/verifier entry is a persistent code-loading point. Keeping
 the shim minimal, protected and auditable is part of the design; there is no
@@ -80,13 +78,16 @@ claim of zero risk against a compromised administrator account.
 
 ## How it works
 
-- `AMVerifierShim.dll` is loaded by the Windows Application Verifier
-  infrastructure for `AppleMusic.exe`. It starts `AMPLibraryAgent.exe` through
-  Apple's packaged COM server.
-- `AMAudioBridge.dll` is registered per user for `CLSID_MMDeviceEnumerator`. It
-  forwards device enumeration to `MMDevApi.dll`, then hooks audio client
-  creation, the `IAudioClient` interface and Apple's CoreAudio format functions.
-- `AMPrefsPersist.dll` is loaded into the agent and fixes settings persistence
+- Apple Music starts `AMPLibraryAgent.exe` normally.
+- Windows Application Verifier loads `AMVerifierShim.dll` only for
+  `AMPLibraryAgent.exe`.
+- The shim verifies the bridge hash and loads `AMAudioBridge.dll` in-process.
+  The bridge hooks audio client creation, `IAudioClient` and Apple's CoreAudio
+  format functions.
+- The UI process is not instrumented by Application Verifier; this avoids the
+  startup and stability problems seen when the verifier was attached to the
+  V8-based UI.
+- `AMPrefsPersist.dll` is loaded by the bridge and fixes settings persistence
   when Apple's MSIX LocalCache is redirected to another volume.
 
 The bridge never resamples. ASIO opens the driver at the source rate and
@@ -101,9 +102,9 @@ The setup program stores the output mode here:
 HKCU\Software\AppleMusicASIO\Mode
 ```
 
-Values: `wasapi`, `asio`, `auto`, `monitor`, `off`. The registry value
-overrides `Mode` in `AMAudioBridge.ini`. Other settings remain in the INI next
-to the installed DLL:
+Values: `wasapi`, `asio`, `auto`, `monitor`, `off`. The registry value overrides
+`Mode` in `AMAudioBridge.ini`. Other settings are read from the INI in
+`%ProgramFiles%\AppleMusicASIO`:
 
 ```ini
 [Bridge]
@@ -128,13 +129,16 @@ WASAPI exclusive. `unity` leaves software gain alone; Apple applies its own
 volume before handing PCM to the render stream. `monitor` keeps the normal
 Windows audio path for troubleshooting.
 
+Bridge logs are written to `%LOCALAPPDATA%\AppleMusicASIO\bridge.log` when the
+Program Files directory is not writable.
+
 ## Limitations
 
-- The verifier shim needs administrator installation and a machine-wide IFEO
-  entry. The system-wide entry targets every image named `AppleMusic.exe`; the
-  shim's package check limits its effect to the real Apple Music package.
-- The per-user `MMDeviceEnumerator` override affects other processes that create
-  an audio device enumerator. Non-target processes only forward the calls.
+- The installer needs administrator rights and writes a machine-wide IFEO entry
+  for `AMPLibraryAgent.exe`. The shim's package check limits its effect to the
+  real Apple Music package.
+- The bridge must be updated together with the shim because its hash is compiled
+  into the shim.
 - WASAPI exclusive holds the device until the app releases the stream. A paused
   track can prevent another application from opening the device exclusively.
 - The MiniFuse WDM endpoint accepts 32-bit PCM with 24 valid bits, not float32.
@@ -148,14 +152,14 @@ Windows audio path for troubleshooting.
 From a Visual Studio x64 developer environment:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\build.ps1 -OutputDir bin\x64\Release\v050
-powershell -ExecutionPolicy Bypass -File .\release.ps1 -BuildDir bin\x64\Release\v050 -Version 0.5.0
+powershell -ExecutionPolicy Bypass -File .\build.ps1 -OutputDir bin\x64\Release\v061
+powershell -ExecutionPolicy Bypass -File .\release.ps1 -BuildDir bin\x64\Release\v061 -Version 0.6.1
 ```
 
-The release contains `AMAudioBridgeSetup.exe`, `AMVerifierSetup.exe`,
-`AMAudioBridge.dll`, `AMVerifierShim.dll`, `AMPrefsPersist.dll`,
-`AMAudioBridge.ini`, `README.md` and `LICENSE`. The build directory also
-contains diagnostic tools that are not packaged.
+The release contains `AMAudioBridgeSetup.exe`, `AMAudioBridge.dll`,
+`AMVerifierShim.dll`, `AMPrefsPersist.dll`, `AMAudioBridge.ini`, `README.md`
+and `LICENSE`. The build directory also contains diagnostic tools that are not
+packaged.
 
 Binaries are x64, use the static C runtime (`/MT`), and depend only on standard
 Windows system DLLs. Source and release text are ASCII-only.

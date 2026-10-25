@@ -1,4 +1,5 @@
 #include "setup_common.h"
+#include "verifier_install.h"
 
 #include <shlobj.h>
 #include <shellapi.h>
@@ -409,14 +410,26 @@ BOOL Setup_EnsurePreferencesJunction(BOOL repair, wchar_t* message, size_t count
 const wchar_t* Setup_InstallDir(void)
 {
     if (g_install_dir[0]) return g_install_dir;
+    if (!Verifier_GetMachineDir(g_install_dir, MAX_PATH)) {
+        wchar_t programFiles[MAX_PATH];
+        DWORD n = GetEnvironmentVariableW(L"ProgramFiles", programFiles, MAX_PATH);
+        if (!n || n >= MAX_PATH) {
+            wcsncpy_s(programFiles, MAX_PATH, L"C:\\Program Files", _TRUNCATE);
+        }
+        _snwprintf_s(g_install_dir, MAX_PATH, _TRUNCATE, L"%s\\%s", programFiles,
+                     AMB_INSTALL_DIR_NAME);
+    }
+    return g_install_dir;
+}
+
+static void LegacyInstallDir(wchar_t* out, DWORD count)
+{
     wchar_t local[MAX_PATH];
     DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
     if (!n || n >= MAX_PATH) {
         wcsncpy_s(local, MAX_PATH, L"C:\\Users\\Default\\AppData\\Local", _TRUNCATE);
     }
-    _snwprintf_s(g_install_dir, MAX_PATH, _TRUNCATE, L"%s\\%s", local,
-                 AMB_INSTALL_DIR_NAME);
-    return g_install_dir;
+    _snwprintf_s(out, count, _TRUNCATE, L"%s\\%s", local, AMB_INSTALL_DIR_NAME);
 }
 
 static void BridgePath(wchar_t* out, DWORD count)
@@ -424,20 +437,25 @@ static void BridgePath(wchar_t* out, DWORD count)
     _snwprintf_s(out, count, _TRUNCATE, L"%s\\%s", Setup_InstallDir(), AMB_LAUNCHER_NAME);
 }
 
+static void LegacyBridgePath(wchar_t* out, DWORD count)
+{
+    wchar_t legacy[MAX_PATH];
+    LegacyInstallDir(legacy, MAX_PATH);
+    _snwprintf_s(out, count, _TRUNCATE, L"%s\\%s", legacy, AMB_LAUNCHER_NAME);
+}
+
 static void EarlyProxyPath(wchar_t* out, DWORD count)
 {
-    _snwprintf_s(out, count, _TRUNCATE, L"%s\\%s", Setup_InstallDir(), AMB_EARLY_NAME);
+    wchar_t legacy[MAX_PATH];
+    LegacyInstallDir(legacy, MAX_PATH);
+    _snwprintf_s(out, count, _TRUNCATE, L"%s\\%s", legacy, AMB_EARLY_NAME);
 }
 
 BOOL Setup_IsInstalled(void)
 {
-    wchar_t path[MAX_PATH];
-    if (!ReadRegString(HKEY_CURRENT_USER, AMB_ENUM_CLSID_KEY, NULL, path, MAX_PATH, NULL)) {
-        return FALSE;
-    }
     wchar_t bridge[MAX_PATH];
     BridgePath(bridge, MAX_PATH);
-    return _wcsicmp(path, bridge) == 0 &&
+    return Verifier_IsInstalled() &&
            GetFileAttributesW(bridge) != INVALID_FILE_ATTRIBUTES;
 }
 
@@ -457,35 +475,6 @@ BOOL Setup_SetMode(const wchar_t* mode)
     return WriteRegString(HKEY_CURRENT_USER, AMB_SETUP_KEY, L"Mode", mode);
 }
 
-static BOOL RegisterInprocServer(const wchar_t* key, const wchar_t* dll)
-{
-    HKEY h = NULL;
-    DWORD disp = 0;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, key, 0, NULL, 0,
-                        KEY_WRITE | KEY_WOW64_64KEY, NULL, &h, &disp) != ERROR_SUCCESS) {
-        return FALSE;
-    }
-    DWORD bytes = (DWORD)((wcslen(dll) + 1) * sizeof(wchar_t));
-    LONG rc = RegSetValueExW(h, NULL, 0, REG_SZ, (const BYTE*)dll, bytes);
-    if (rc == ERROR_SUCCESS) {
-        const wchar_t* both = L"Both";
-        rc = RegSetValueExW(h, L"ThreadingModel", 0, REG_SZ, (const BYTE*)both,
-                            (DWORD)((wcslen(both) + 1) * sizeof(wchar_t)));
-    }
-    RegCloseKey(h);
-    return rc == ERROR_SUCCESS;
-}
-
-static BOOL RegisterComServer(const wchar_t* bridge)
-{
-    return RegisterInprocServer(AMB_ENUM_CLSID_KEY, bridge);
-}
-
-static BOOL RegisterEarlyProxy(const wchar_t* early)
-{
-    return RegisterInprocServer(AMB_EARLY_CLSID_KEY, early);
-}
-
 static void UnregisterInprocServer(const wchar_t* key, const wchar_t* root,
                                    const wchar_t* dll)
 {
@@ -500,7 +489,7 @@ static void UnregisterInprocServer(const wchar_t* key, const wchar_t* root,
 static void UnregisterComServer(void)
 {
     wchar_t bridge[MAX_PATH];
-    BridgePath(bridge, MAX_PATH);
+    LegacyBridgePath(bridge, MAX_PATH);
     UnregisterInprocServer(AMB_ENUM_CLSID_KEY,
                            L"Software\\Classes\\CLSID\\{BCDE0395-E52F-467C-8E3D-C4579291692E}",
                            bridge);
@@ -522,7 +511,8 @@ BOOL Setup_Install(const wchar_t* mode, wchar_t* message, size_t count)
     else source[0] = 0;
 
     const wchar_t* files[] = {
-        L"AMAudioBridge.dll", L"AMPrefsPersist.dll", L"AMAudioBridge.ini"
+        L"AMVerifierShim.dll", L"AMAudioBridge.dll", L"AMPrefsPersist.dll",
+        L"AMAudioBridge.ini"
     };
     for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); ++i) {
         wchar_t src[MAX_PATH];
@@ -533,8 +523,9 @@ BOOL Setup_Install(const wchar_t* mode, wchar_t* message, size_t count)
         }
     }
 
-    SHCreateDirectoryExW(NULL, Setup_InstallDir(), NULL);
-    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); ++i) {
+    if (!Verifier_Install(source, message, count)) return FALSE;
+
+    for (size_t i = 1; i < sizeof(files) / sizeof(files[0]); ++i) {
         wchar_t src[MAX_PATH], dst[MAX_PATH];
         _snwprintf_s(src, MAX_PATH, _TRUNCATE, L"%s\\%s", source, files[i]);
         _snwprintf_s(dst, MAX_PATH, _TRUNCATE, L"%s\\%s", Setup_InstallDir(), files[i]);
@@ -542,18 +533,12 @@ BOOL Setup_Install(const wchar_t* mode, wchar_t* message, size_t count)
         DWORD error = 0;
         if (!ReplaceFileIfNeeded(src, dst, &error) && error != ERROR_FILE_EXISTS) {
             SetMessage(message, count,
-                       L"Could not replace bridge files. Close applications using the audio bridge and retry.");
+                       L"Bridge files could not be installed. Close Apple Music and retry.");
             return FALSE;
         }
     }
 
-    wchar_t bridge[MAX_PATH];
-    BridgePath(bridge, MAX_PATH);
-    if (!RegisterComServer(bridge)) {
-        SetMessage(message, count, L"Could not register the COM bridge");
-        return FALSE;
-    }
-
+    UnregisterComServer();
     UnregisterEarlyProxy();
     WriteRegString(HKEY_CURRENT_USER, AMB_SETUP_KEY, L"InstallDir", Setup_InstallDir());
     if (mode && *mode) Setup_SetMode(mode);
@@ -570,14 +555,16 @@ BOOL Setup_Install(const wchar_t* mode, wchar_t* message, size_t count)
 
 BOOL Setup_Uninstall(wchar_t* message, size_t count)
 {
+    if (!Verifier_Uninstall(message, count)) return FALSE;
+
     UnregisterComServer();
     UnregisterEarlyProxy();
+
     wchar_t root[MAX_PATH];
     wcsncpy_s(root, MAX_PATH, Setup_InstallDir(), _TRUNCATE);
 
     const wchar_t* files[] = {
-        L"AMAudioBridge.ini", L"AMPrefsPersist.dll", L"AMAudioBridge.dll",
-        L"AMEarlyProxy.dll"
+        L"AMAudioBridge.ini", L"AMPrefsPersist.dll", L"AMAudioBridge.dll"
     };
     for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); ++i) {
         wchar_t path[MAX_PATH];
@@ -587,8 +574,25 @@ BOOL Setup_Uninstall(wchar_t* message, size_t count)
             MoveFileExW(path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
         }
     }
+
+    wchar_t legacy[MAX_PATH];
+    LegacyInstallDir(legacy, MAX_PATH);
+    const wchar_t* oldFiles[] = {
+        L"AMAudioBridge.ini", L"AMPrefsPersist.dll", L"AMAudioBridge.dll",
+        L"AMEarlyProxy.dll"
+    };
+    for (size_t i = 0; i < sizeof(oldFiles) / sizeof(oldFiles[0]); ++i) {
+        wchar_t path[MAX_PATH];
+        _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s\\%s", legacy, oldFiles[i]);
+        if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) continue;
+        if (!DeleteFileW(path) && GetLastError() != ERROR_FILE_NOT_FOUND) {
+            MoveFileExW(path, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+        }
+    }
+
     RemoveDirectoryW(root);
+    RemoveDirectoryW(legacy);
     RegDeleteKeyW(HKEY_CURRENT_USER, AMB_SETUP_KEY);
-    SetMessage(message, count, L"Uninstalled. Restart Apple Music. Files in use will be removed at reboot.");
+    SetMessage(message, count, L"Uninstalled. Restart Apple Music.");
     return TRUE;
 }

@@ -1,6 +1,8 @@
 #include "common.h"
 #include "setup_common.h"
 
+#include <shellapi.h>
+
 #define IDC_STATUS 1001
 #define IDC_WASAPI 1002
 #define IDC_ASIO 1003
@@ -17,6 +19,38 @@ static HWND g_install;
 static HWND g_uninstall;
 static HFONT g_font;
 static BOOL g_installed;
+
+static BOOL IsElevated(void)
+{
+    HANDLE token = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return FALSE;
+    TOKEN_ELEVATION elevation;
+    DWORD size = 0;
+    BOOL elevated = FALSE;
+    if (GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size)) {
+        elevated = elevation.TokenIsElevated != 0;
+    }
+    CloseHandle(token);
+    return elevated;
+}
+
+static BOOL RelaunchElevated(void)
+{
+    wchar_t exe[MAX_PATH];
+    DWORD n = GetModuleFileNameW(NULL, exe, MAX_PATH);
+    if (!n || n >= MAX_PATH) return FALSE;
+
+    SHELLEXECUTEINFOW info;
+    ZeroMemory(&info, sizeof(info));
+    info.cbSize = sizeof(info);
+    info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    info.lpVerb = L"runas";
+    info.lpFile = exe;
+    info.nShow = SW_SHOWNORMAL;
+    if (!ShellExecuteExW(&info)) return FALSE;
+    if (info.hProcess) CloseHandle(info.hProcess);
+    return TRUE;
+}
 
 static const wchar_t* SelectedMode(void)
 {
@@ -69,7 +103,10 @@ static void UninstallBridge(HWND hwnd)
     }
 
     wchar_t message[1024];
-    Setup_Uninstall(message, 1024);
+    if (!Setup_Uninstall(message, 1024)) {
+        MessageBoxW(hwnd, message, L"Apple Music ASIO", MB_ICONERROR | MB_OK);
+        return;
+    }
     MessageBoxW(hwnd, message, L"Apple Music ASIO", MB_ICONINFORMATION | MB_OK);
     RefreshStatus();
 }
@@ -183,6 +220,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, LPWSTR command_line,
     (void)previous;
     (void)command_line;
     SetProcessDPIAware();
+
+    if (!IsElevated()) {
+        if (!RelaunchElevated() && GetLastError() != ERROR_CANCELLED) {
+            MessageBoxW(NULL, L"Administrator privileges are required.",
+                        L"Apple Music ASIO", MB_ICONERROR | MB_OK);
+        }
+        return 0;
+    }
 
     WNDCLASSEXW wc;
     ZeroMemory(&wc, sizeof(wc));

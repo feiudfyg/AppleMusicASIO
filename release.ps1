@@ -1,6 +1,6 @@
 param(
-    [string]$BuildDir = 'bin\x64\Release\v050',
-    [string]$Version = '0.5.0'
+    [string]$BuildDir = 'bin\x64\Release\v061',
+    [string]$Version = '0.6.1'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -18,7 +18,6 @@ New-Item -ItemType Directory -Force $release | Out-Null
 
 $files = @(
     'AMAudioBridgeSetup.exe',
-    'AMVerifierSetup.exe',
     'AMAudioBridge.dll',
     'AMVerifierShim.dll',
     'AMPrefsPersist.dll',

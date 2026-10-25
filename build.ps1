@@ -57,11 +57,18 @@ function Build-Target([string]$name, [string[]]$sources, [string]$linkArgs,
 $dllSources = @(
     'src\bridge.c', 'src\log.c', 'src\config.c', 'src\format.c', 'src\ring.c',
     'src\asio_host.c', 'src\sink_asio.c', 'src\sink_wasapi.c', 'src\stream.c',
-    'src\hooks.c', 'src\app_hooks.c', 'src\guids.c', 'src\setup_common.c'
+    'src\hooks.c', 'src\app_hooks.c', 'src\guids.c', 'src\setup_common.c',
+    'src\verifier_stub.c'
 )
 Build-Target 'bridge' $dllSources ('/DLL /OUT:' + (Join-Path $out 'AMAudioBridge.dll') +
     ' /EXPORT:DllGetClassObject,PRIVATE /EXPORT:DllCanUnloadNow,PRIVATE' +
     ' ole32.lib uuid.lib advapi32.lib propsys.lib shell32.lib')
+
+$bridgePath = Join-Path $out 'AMAudioBridge.dll'
+$bridgeHash = (Get-FileHash $bridgePath -Algorithm SHA256).Hash.ToLowerInvariant()
+$hashHeader = Join-Path $out 'bridge_hash.h'
+$hashText = "#pragma once`r`n#define AMB_BRIDGE_SHA256 L`"$bridgeHash`"`r`n"
+Set-Content -Path $hashHeader -Encoding ascii -NoNewline -Value $hashText
 
 $probeSources = @('src\probe.c', 'src\format.c', 'src\guids.c')
 Build-Target 'probe' $probeSources ('/OUT:' + (Join-Path $out 'AMAudioProbe.exe') +
@@ -83,13 +90,10 @@ Build-Target 'earlyproxy' @('src\early_proxy.c', 'src\log.c') ('/DLL /OUT:' + (J
     ' /EXPORT:DllGetClassObject,PRIVATE /EXPORT:DllCanUnloadNow,PRIVATE ole32.lib advapi32.lib /LTCG') @('/O1', '/GL')
 
 Build-Target 'verifiershim' @('src\verifier_shim.c') ('/DLL /OUT:' + (Join-Path $out 'AMVerifierShim.dll') +
-    ' ole32.lib /LTCG') @('/O1', '/GL')
+    ' advapi32.lib bcrypt.lib /LTCG') @('/O1', '/GL', '/I', $out)
 
-Build-Target 'verifiersetup' @('src\verifier_setup.c') ('/SUBSYSTEM:CONSOLE /OUT:' + (Join-Path $out 'AMVerifierSetup.exe') +
-    ' advapi32.lib shell32.lib bcrypt.lib /LTCG') @('/O1', '/GL')
-
-Build-Target 'setup' @('src\setup.c', 'src\setup_common.c') ('/SUBSYSTEM:WINDOWS /OUT:' + (Join-Path $out 'AMAudioBridgeSetup.exe') +
-    ' user32.lib gdi32.lib shell32.lib advapi32.lib /LTCG') @('/O1', '/GL')
+Build-Target 'setup' @('src\setup.c', 'src\setup_common.c', 'src\verifier_install.c') ('/SUBSYSTEM:WINDOWS /OUT:' + (Join-Path $out 'AMAudioBridgeSetup.exe') +
+    ' user32.lib gdi32.lib shell32.lib advapi32.lib bcrypt.lib /LTCG') @('/O1', '/GL')
 
 Build-Target 'injector' @('src\injector.c') ('/OUT:' + (Join-Path $out 'AMAudioBridgeInjector.exe') +
     ' ole32.lib uuid.lib advapi32.lib')
