@@ -437,16 +437,8 @@ BOOL Setup_IsInstalled(void)
     }
     wchar_t bridge[MAX_PATH];
     BridgePath(bridge, MAX_PATH);
-    if (_wcsicmp(path, bridge) != 0 || GetFileAttributesW(bridge) == INVALID_FILE_ATTRIBUTES) {
-        return FALSE;
-    }
-
-    wchar_t early[MAX_PATH];
-    EarlyProxyPath(early, MAX_PATH);
-    if (!ReadRegString(HKEY_CURRENT_USER, AMB_EARLY_CLSID_KEY, NULL, path, MAX_PATH, NULL)) {
-        return FALSE;
-    }
-    return !_wcsicmp(path, early) && GetFileAttributesW(early) != INVALID_FILE_ATTRIBUTES;
+    return _wcsicmp(path, bridge) == 0 &&
+           GetFileAttributesW(bridge) != INVALID_FILE_ATTRIBUTES;
 }
 
 BOOL Setup_GetMode(wchar_t* mode, size_t count)
@@ -530,8 +522,7 @@ BOOL Setup_Install(const wchar_t* mode, wchar_t* message, size_t count)
     else source[0] = 0;
 
     const wchar_t* files[] = {
-        L"AMAudioBridge.dll", L"AMEarlyProxy.dll", L"AMPrefsPersist.dll",
-        L"AMAudioBridge.ini"
+        L"AMAudioBridge.dll", L"AMPrefsPersist.dll", L"AMAudioBridge.ini"
     };
     for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); ++i) {
         wchar_t src[MAX_PATH];
@@ -563,16 +554,7 @@ BOOL Setup_Install(const wchar_t* mode, wchar_t* message, size_t count)
         return FALSE;
     }
 
-    wchar_t early[MAX_PATH];
-    EarlyProxyPath(early, MAX_PATH);
-    if (GetFileAttributesW(early) == INVALID_FILE_ATTRIBUTES) {
-        SetMessage(message, count, L"AMEarlyProxy.dll is missing from the setup folder");
-        return FALSE;
-    }
-    if (!RegisterEarlyProxy(early)) {
-        SetMessage(message, count, L"Could not register the early COM proxy");
-        return FALSE;
-    }
+    UnregisterEarlyProxy();
     WriteRegString(HKEY_CURRENT_USER, AMB_SETUP_KEY, L"InstallDir", Setup_InstallDir());
     if (mode && *mode) Setup_SetMode(mode);
 

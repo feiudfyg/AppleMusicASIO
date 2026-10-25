@@ -82,6 +82,12 @@ Build-Target 'prefspersist' @('src\prefs_probe.c') ('/DLL /OUT:' + (Join-Path $o
 Build-Target 'earlyproxy' @('src\early_proxy.c', 'src\log.c') ('/DLL /OUT:' + (Join-Path $out 'AMEarlyProxy.dll') +
     ' /EXPORT:DllGetClassObject,PRIVATE /EXPORT:DllCanUnloadNow,PRIVATE ole32.lib advapi32.lib /LTCG') @('/O1', '/GL')
 
+Build-Target 'verifiershim' @('src\verifier_shim.c') ('/DLL /OUT:' + (Join-Path $out 'AMVerifierShim.dll') +
+    ' ole32.lib /LTCG') @('/O1', '/GL')
+
+Build-Target 'verifiersetup' @('src\verifier_setup.c') ('/SUBSYSTEM:CONSOLE /OUT:' + (Join-Path $out 'AMVerifierSetup.exe') +
+    ' advapi32.lib shell32.lib bcrypt.lib /LTCG') @('/O1', '/GL')
+
 Build-Target 'setup' @('src\setup.c', 'src\setup_common.c') ('/SUBSYSTEM:WINDOWS /OUT:' + (Join-Path $out 'AMAudioBridgeSetup.exe') +
     ' user32.lib gdi32.lib shell32.lib advapi32.lib /LTCG') @('/O1', '/GL')
 
