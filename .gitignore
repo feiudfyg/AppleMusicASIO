@@ -11,3 +11,5 @@ AMAudioBridge.log
 *.log
 *.dmp
 PrefsDumps/
+
+AppleMusicASIO-RE/
