@@ -112,8 +112,8 @@ Windows audio path for troubleshooting.
 From a Visual Studio x64 developer environment:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\build.ps1 -OutputDir bin\x64\Release\v041
-powershell -ExecutionPolicy Bypass -File .\release.ps1 -BuildDir bin\x64\Release\v041 -Version 0.4.1
+powershell -ExecutionPolicy Bypass -File .\build.ps1 -OutputDir bin\x64\Release\v042
+powershell -ExecutionPolicy Bypass -File .\release.ps1 -BuildDir bin\x64\Release\v042 -Version 0.4.2
 ```
 
 The release contains `AMAudioBridgeSetup.exe`, `AMAudioBridge.dll`,

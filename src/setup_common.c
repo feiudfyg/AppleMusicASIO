@@ -124,6 +124,32 @@ static BOOL CopyTree(const wchar_t* source, const wchar_t* target)
     return ok;
 }
 
+static BOOL ReplaceFileIfNeeded(const wchar_t* source, const wchar_t* target,
+                                DWORD* error)
+{
+    if (CopyFileW(source, target, FALSE)) return TRUE;
+    *error = GetLastError();
+
+    if (GetFileAttributesW(target) == INVALID_FILE_ATTRIBUTES) return FALSE;
+
+    wchar_t backup[MAX_PATH];
+    _snwprintf_s(backup, MAX_PATH, _TRUNCATE, L"%s.old.%lu",
+                 target, (unsigned long)GetTickCount());
+    if (!MoveFileExW(target, backup, MOVEFILE_REPLACE_EXISTING)) {
+        *error = GetLastError();
+        return FALSE;
+    }
+
+    if (!CopyFileW(source, target, FALSE)) {
+        *error = GetLastError();
+        MoveFileExW(backup, target, MOVEFILE_REPLACE_EXISTING);
+        return FALSE;
+    }
+
+    MoveFileExW(backup, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+    return TRUE;
+}
+
 static BOOL GetReparseTarget(const wchar_t* path, wchar_t* out, DWORD count)
 {
     HANDLE h = CreateFileW(path, FILE_READ_ATTRIBUTES,
@@ -522,8 +548,10 @@ BOOL Setup_Install(const wchar_t* mode, wchar_t* message, size_t count)
         _snwprintf_s(src, MAX_PATH, _TRUNCATE, L"%s\\%s", source, files[i]);
         _snwprintf_s(dst, MAX_PATH, _TRUNCATE, L"%s\\%s", Setup_InstallDir(), files[i]);
         if (!_wcsicmp(src, dst)) continue;
-        if (!CopyFileW(src, dst, FALSE) && GetLastError() != ERROR_FILE_EXISTS) {
-            SetMessage(message, count, L"Could not copy bridge files; close Apple Music and retry");
+        DWORD error = 0;
+        if (!ReplaceFileIfNeeded(src, dst, &error) && error != ERROR_FILE_EXISTS) {
+            SetMessage(message, count,
+                       L"Could not replace bridge files. Close applications using the audio bridge and retry.");
             return FALSE;
         }
     }

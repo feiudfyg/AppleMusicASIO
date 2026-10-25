@@ -162,15 +162,20 @@ static DWORD WINAPI PrestartThread(void* parameter)
     return 0;
 }
 
-static void StartPrestartIfNeeded(void)
+static BOOL IsAppleMusicProcess(void)
 {
     wchar_t exe[MAX_PATH];
     DWORD n = GetModuleFileNameW(NULL, exe, MAX_PATH);
-    if (!n || n >= MAX_PATH) return;
+    if (!n || n >= MAX_PATH) return FALSE;
 
     const wchar_t* base = wcsrchr(exe, L'\\');
     base = base ? base + 1 : exe;
-    if (_wcsicmp(base, L"AppleMusic.exe") != 0) return;
+    return _wcsicmp(base, L"AppleMusic.exe") == 0;
+}
+
+static void StartPrestartIfNeeded(void)
+{
+    if (!IsAppleMusicProcess()) return;
     if (InterlockedCompareExchange(&g_prestart_started, 1, 0) != 0) return;
 
     InterlockedExchange(&g_prestart_running, 1);
@@ -198,7 +203,7 @@ STDAPI DllGetClassObject(REFCLSID clsid, REFIID riid, void** ppv)
 STDAPI DllCanUnloadNow(void)
 {
     if (InterlockedCompareExchange(&g_prestart_running, 0, 0) != 0) return S_FALSE;
-    return S_FALSE;
+    return IsAppleMusicProcess() ? S_FALSE : S_OK;
 }
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)

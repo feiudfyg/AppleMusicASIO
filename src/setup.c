@@ -10,6 +10,7 @@
 #define IDC_CLOSE 1007
 
 static HWND g_status;
+static HWND g_location;
 static HWND g_wasapi;
 static HWND g_asio;
 static HWND g_install;
@@ -37,12 +38,14 @@ static void RefreshStatus(void)
     SendMessageW(g_wasapi, BM_SETCHECK, wasapi ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(g_asio, BM_SETCHECK, wasapi ? BST_UNCHECKED : BST_CHECKED, 0);
 
-    wchar_t text[1024];
-    _snwprintf_s(text, 1024, _TRUNCATE,
-                 L"Status: %ls\r\nLocation: %ls",
-                 g_installed ? L"Installed" : L"Not installed",
-                 Setup_InstallDir());
+    wchar_t text[512];
+    _snwprintf_s(text, 512, _TRUNCATE,
+                 L"Status: %ls",
+                 g_installed ? L"Installed" : L"Not installed");
     SetWindowTextW(g_status, text);
+    _snwprintf_s(text, 512, _TRUNCATE,
+                 L"Location: %ls", Setup_InstallDir());
+    SetWindowTextW(g_location, text);
     EnableWindow(g_install, !g_installed);
     EnableWindow(g_uninstall, g_installed);
 }
@@ -84,9 +87,15 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                    18, 14, 398, 24, hwnd, NULL, NULL, NULL);
         SetFont(title);
 
-        g_status = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
-                                 18, 44, 398, 46, hwnd, (HMENU)IDC_STATUS, NULL, NULL);
+        g_status = CreateWindowW(L"STATIC", L"",
+                                 WS_CHILD | WS_VISIBLE | SS_LEFT | SS_LEFTNOWORDWRAP | SS_NOPREFIX,
+                                 18, 44, 398, 20, hwnd, (HMENU)IDC_STATUS, NULL, NULL);
         SetFont(g_status);
+
+        g_location = CreateWindowW(L"STATIC", L"",
+                                   WS_CHILD | WS_VISIBLE | SS_LEFT | SS_PATHELLIPSIS | SS_NOPREFIX,
+                                   18, 66, 398, 20, hwnd, NULL, NULL, NULL);
+        SetFont(g_location);
 
         HWND group = CreateWindowW(L"BUTTON", L"Output mode",
                                    WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
@@ -113,8 +122,8 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SetFont(g_uninstall);
 
         HWND hint = CreateWindowW(L"STATIC", L"Restart Apple Music after a change.",
-                                  WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
-                                  18, 188, 220, 20, hwnd, NULL, NULL, NULL);
+                                  WS_CHILD | WS_VISIBLE | SS_LEFT | SS_LEFTNOWORDWRAP | SS_NOPREFIX,
+                                  18, 188, 398, 20, hwnd, NULL, NULL, NULL);
         SetFont(hint);
 
         HWND apply = CreateWindowW(L"BUTTON", L"Apply",

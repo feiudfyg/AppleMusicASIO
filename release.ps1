@@ -1,6 +1,6 @@
 param(
-    [string]$BuildDir = 'bin\x64\Release\v041',
-    [string]$Version = '0.4.1'
+    [string]$BuildDir = 'bin\x64\Release\v042',
+    [string]$Version = '0.4.2'
 )
 
 $ErrorActionPreference = 'Stop'
