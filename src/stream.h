@@ -41,16 +41,24 @@ struct Stream {
     struct AmbSink* sink;
     AmbRing ring;
     uint8_t* staging;
-    uint32_t period_frames;
+    uint32_t app_period_frames;
 
     HANDLE app_event;
+    HANDLE pace_event;
 
     BOOL fake;
+    BOOL capture;
     BOOL initialized;
     BOOL started;
+    BOOL sink_started;
     BOOL bitperfect;
     int mode;
+    AmbAudioFormat capture_fmt;
+    volatile LONG64 capture_frames;
+    volatile LONG sink_starting;
 
+    volatile LONG64 app_submitted;
+    LARGE_INTEGER app_clock_start;
     volatile LONG64 frames_played;
     volatile float gain;
     volatile BOOL mute;
@@ -63,8 +71,13 @@ void Stream_Release(Stream* s);
 void Stream_EndFake(Stream* s);
 BOOL Stream_BeginFake(Stream* s, const AmbAudioFormat* fmt, int mode,
                       const RealClientFns* real_fns);
+BOOL Stream_BeginCapture(Stream* s, const AmbAudioFormat* app_fmt,
+                         const AmbAudioFormat* capture_fmt);
+BOOL Stream_EnsureCaptureSink(Stream* s);
+BOOL Stream_WriteCapture(Stream* s, const void* data, uint32_t frames);
 void Stream_Signal(Stream* s);
 void Stream_GetStats(Stream* s, LONG64* frames);
+LONG64 Stream_GetAppFramesPlayed(Stream* s);
 
 IAudioRenderClient* Stream_GetRenderClient(Stream* s);
 IAudioClock* Stream_GetClock(Stream* s);

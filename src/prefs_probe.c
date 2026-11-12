@@ -156,23 +156,51 @@ static void Mark(uintptr_t base)
     }
 }
 
+static BOOL Readable(const void* address, size_t size)
+{
+    uintptr_t current = (uintptr_t)address;
+    uintptr_t end = current + size;
+    if (end < current) return FALSE;
+
+    while (current < end) {
+        MEMORY_BASIC_INFORMATION info;
+        if (!VirtualQuery((LPCVOID)current, &info, sizeof(info))) return FALSE;
+        if (info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+            return FALSE;
+        }
+        uintptr_t region_end = (uintptr_t)info.BaseAddress + info.RegionSize;
+        if (region_end <= current) return FALSE;
+        current = region_end;
+    }
+    return TRUE;
+}
+
 static int PatchModule(HMODULE module, const wchar_t* module_name)
 {
     BYTE* base = (BYTE*)module;
-    if (!base) return 0;
+    if (!base || !Readable(base, sizeof(IMAGE_DOS_HEADER))) return 0;
     PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    if (dos->e_lfanew <= 0 || dos->e_lfanew > 0x100000) return 0;
+    if (!Readable(base + dos->e_lfanew, sizeof(IMAGE_NT_HEADERS))) return 0;
     PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)(base + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
 
     IMAGE_DATA_DIRECTORY dir =
         nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (!dir.VirtualAddress || dir.Size < sizeof(IMAGE_IMPORT_DESCRIPTOR)) return 0;
+    if (!dir.VirtualAddress || dir.Size < sizeof(IMAGE_IMPORT_DESCRIPTOR) ||
+        !Readable(base + dir.VirtualAddress, sizeof(IMAGE_IMPORT_DESCRIPTOR))) {
+        return 0;
+    }
 
     int patched = 0;
     DWORD count = dir.Size / sizeof(IMAGE_IMPORT_DESCRIPTOR);
     PIMAGE_IMPORT_DESCRIPTOR imp = (PIMAGE_IMPORT_DESCRIPTOR)(base + dir.VirtualAddress);
-    for (DWORD d = 0; d < count && imp->Name; ++d, ++imp) {
+    for (DWORD d = 0; d < count; ++d, ++imp) {
+        if (!Readable(imp, sizeof(*imp)) || !imp->Name ||
+            !Readable(base + imp->Name, 1)) {
+            break;
+        }
         const char* dll = (const char*)(base + imp->Name);
         if (_stricmp(dll, "KERNEL32.dll") != 0 && _stricmp(dll, "KERNELBASE.dll") != 0) {
             continue;
@@ -181,8 +209,15 @@ static int PatchModule(HMODULE module, const wchar_t* module_name)
                                     ? (PIMAGE_THUNK_DATA)(base + imp->OriginalFirstThunk)
                                     : (PIMAGE_THUNK_DATA)(base + imp->FirstThunk);
         PIMAGE_THUNK_DATA ft = (PIMAGE_THUNK_DATA)(base + imp->FirstThunk);
-        for (; oft->u1.AddressOfData; ++oft, ++ft) {
+        for (;; ++oft, ++ft) {
+            if (!Readable(oft, sizeof(*oft)) || !Readable(ft, sizeof(*ft)) ||
+                !oft->u1.AddressOfData) {
+                break;
+            }
             if (oft->u1.Ordinal & IMAGE_ORDINAL_FLAG) continue;
+            if (!Readable(base + oft->u1.AddressOfData, sizeof(IMAGE_IMPORT_BY_NAME))) {
+                break;
+            }
             PIMAGE_IMPORT_BY_NAME name =
                 (PIMAGE_IMPORT_BY_NAME)(base + oft->u1.AddressOfData);
             for (size_t i = 0; i < sizeof(g_hooks) / sizeof(g_hooks[0]); ++i) {
@@ -206,6 +241,15 @@ static int PatchModule(HMODULE module, const wchar_t* module_name)
     return patched;
 }
 
+static int PatchModuleSafe(HMODULE module, const wchar_t* module_name)
+{
+    __try {
+        return PatchModule(module, module_name);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
 static void PatchAll(void)
 {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
@@ -217,7 +261,7 @@ static void PatchAll(void)
             if ((HMODULE)entry.modBaseAddr == g_module) continue;
             if (Seen((uintptr_t)entry.modBaseAddr)) continue;
             Mark((uintptr_t)entry.modBaseAddr);
-            PatchModule((HMODULE)entry.modBaseAddr, entry.szModule);
+            PatchModuleSafe((HMODULE)entry.modBaseAddr, entry.szModule);
         } while (Module32NextW(snap, &entry));
     }
     CloseHandle(snap);

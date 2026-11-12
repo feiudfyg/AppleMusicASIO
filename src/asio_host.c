@@ -3,6 +3,8 @@
 #include "config.h"
 #include "log.h"
 
+#define AMB_ASIO_SILENCE 0
+
 #include <math.h>
 
 typedef struct AsioState {
@@ -30,6 +32,7 @@ typedef struct AsioState {
 } AsioState;
 
 static AsioState g_asio;
+static uint32_t AsioBytesPerSample(long type);
 
 static CRITICAL_SECTION g_ctl_call_cs;
 static HANDLE g_ctl_cmd_event = NULL;
@@ -419,6 +422,19 @@ static HRESULT StartTask(void* param)
     return S_OK;
 }
 
+static void ZeroAsioOutputs(void)
+{
+    if (!g_asio.have_buffers) return;
+    size_t bytes = (size_t)g_asio.buffer_frames * AsioBytesPerSample(g_asio.sample_type);
+    for (long c = 0; c < g_asio.channels; ++c) {
+        for (int b = 0; b < 2; ++b) {
+            if (g_asio.bufs[c].buffers[b]) {
+                memset(g_asio.bufs[c].buffers[b], 0, bytes);
+            }
+        }
+    }
+}
+
 static HRESULT StopTask(void* param)
 {
     AMB_UNUSED(param);
@@ -426,6 +442,7 @@ static HRESULT StopTask(void* param)
     InterlockedExchange(&g_asio.running, 0);
     if (g_asio.have_buffers) {
         IASIO_CALLO(g_asio.asio, stop);
+        ZeroAsioOutputs();
     }
     return S_OK;
 }
@@ -452,6 +469,7 @@ static HRESULT CloseStreamTask(void* param)
     InterlockedExchange(&g_asio.running, 0);
     if (g_asio.have_buffers) {
         IASIO_CALLO(g_asio.asio, stop);
+        ZeroAsioOutputs();
         IASIO_CALLO(g_asio.asio, disposeBuffers);
         g_asio.have_buffers = 0;
     }
@@ -682,7 +700,7 @@ static void Asio_BufferSwitch(long index, ASIOBool direct)
         if (fill < want) InterlockedIncrement(&g_asio.underruns);
     }
 
-    BOOL mute = c->mute ? *c->mute : FALSE;
+    BOOL mute = AMB_ASIO_SILENCE ? TRUE : (c->mute ? *c->mute : FALSE);
     float gain = c->gain ? *c->gain : 1.0f;
     BOOL apply_gain = c->volume_enabled && c->is_float &&
                       (mute || fabsf(gain - 1.0f) > 1e-7f);
@@ -755,10 +773,16 @@ static void Asio_BufferSwitch(long index, ASIOBool direct)
         }
     }
 
+    /* The hardware clock advances for every ASIO buffer, including buffers
+       that had to be zero-filled.  Pacing must never depend on ring data:
+       otherwise an underrun stalls the producer that is supposed to refill it. */
     if (c->frames_played) {
-        InterlockedExchangeAdd64(c->frames_played, (LONG64)got);
+        InterlockedExchangeAdd64(c->frames_played, (LONG64)frames);
     }
-    InterlockedExchangeAdd64(&g_asio.frames_played, (LONG64)got);
+    InterlockedExchangeAdd64(&g_asio.frames_played, (LONG64)frames);
+    if (c->pace_event && *c->pace_event) {
+        SetEvent(*c->pace_event);
+    }
     if (c->event && *c->event) {
         SetEvent(*c->event);
     }
@@ -801,3 +825,4 @@ static ASIOTime* Asio_BufferSwitchTimeInfo(ASIOTime* params, long index, ASIOBoo
     Asio_BufferSwitch(index, direct);
     return params;
 }
+

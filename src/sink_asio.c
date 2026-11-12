@@ -119,6 +119,7 @@ static void AsioSink_SetRing(AmbSink* base, AmbRing* ring)
     consumer.frame_bytes = sink->fmt.frame_bytes;
     consumer.channels = sink->fmt.channels;
     consumer.event = &s->app_event;
+    consumer.pace_event = &s->pace_event;
     consumer.frames_played = &s->frames_played;
     consumer.gain = &s->gain;
     consumer.mute = &s->mute;

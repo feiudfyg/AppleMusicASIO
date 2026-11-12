@@ -90,9 +90,11 @@ claim of zero risk against a compromised administrator account.
 - `AMPrefsPersist.dll` is loaded by the bridge and fixes settings persistence
   when Apple's MSIX LocalCache is redirected to another volume.
 
-The bridge never resamples. ASIO opens the driver at the source rate and
-channel count. WASAPI exclusive negotiates a format the endpoint accepts; when
-float32 is unavailable, the bridge packs it to an integer PCM format.
+The bridge never resamples. By default it uses the endpoint mix rate; ASIO opens
+the driver at that rate and channel count. WASAPI exclusive negotiates a format
+the endpoint accepts; when float32 is unavailable, the bridge packs it to an
+integer PCM format. `FollowSourceRate=1` is opt-in and may destabilize current
+Apple Music builds by faking the device format rate.
 
 ## Configuration
 
@@ -112,7 +114,7 @@ Mode=auto
 LogLevel=2
 StrictBitPerfect=1
 VolumeControl=unity
-FollowSourceRate=1
+FollowSourceRate=0
 
 [ASIO]
 Driver=auto
@@ -152,8 +154,8 @@ Program Files directory is not writable.
 From a Visual Studio x64 developer environment:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\build.ps1 -OutputDir bin\x64\Release\v061
-powershell -ExecutionPolicy Bypass -File .\release.ps1 -BuildDir bin\x64\Release\v061 -Version 0.6.1
+powershell -ExecutionPolicy Bypass -File .\build.ps1 -OutputDir bin\x64\Release\v062
+powershell -ExecutionPolicy Bypass -File .\release.ps1 -BuildDir bin\x64\Release\v062 -Version 0.6.2
 ```
 
 The release contains `AMAudioBridgeSetup.exe`, `AMAudioBridge.dll`,

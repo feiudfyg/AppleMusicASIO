@@ -17,8 +17,8 @@ New-Item -ItemType Directory -Force $objRoot | Out-Null
 
 $common = @(
     '/nologo', '/std:c11', '/MT', '/W3', '/utf-8', '/guard:cf', '/Gy', '/Gw',
-    '/I', 'src', '/D_CRT_SECURE_NO_WARNINGS', '/DWIN32_LEAN_AND_MEAN',
-    '/DUNICODE', '/D_UNICODE'
+    '/I', 'src', '/I', 'third_party\minhook\include', '/D_CRT_SECURE_NO_WARNINGS',
+    '/DWIN32_LEAN_AND_MEAN', '/DUNICODE', '/D_UNICODE'
 )
 
 function Assert-Ascii([string[]]$paths) {
@@ -58,7 +58,9 @@ $dllSources = @(
     'src\bridge.c', 'src\log.c', 'src\config.c', 'src\format.c', 'src\ring.c',
     'src\asio_host.c', 'src\sink_asio.c', 'src\sink_wasapi.c', 'src\stream.c',
     'src\hooks.c', 'src\app_hooks.c', 'src\guids.c', 'src\setup_common.c',
-    'src\verifier_stub.c'
+    'src\verifier_stub.c',
+    'third_party\minhook\src\hook.c', 'third_party\minhook\src\trampoline.c',
+    'third_party\minhook\src\buffer.c', 'third_party\minhook\src\hde\hde64.c'
 )
 Build-Target 'bridge' $dllSources ('/DLL /OUT:' + (Join-Path $out 'AMAudioBridge.dll') +
     ' /EXPORT:DllGetClassObject,PRIVATE /EXPORT:DllCanUnloadNow,PRIVATE' +

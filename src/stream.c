@@ -3,9 +3,17 @@
 #include "asio_host.h"
 #include "config.h"
 #include "log.h"
+#include <math.h>
 
 static SRWLOCK g_streams_lock = SRWLOCK_INIT;
 static Stream* g_streams[AMB_MAX_STREAMS];
+
+static HANDLE g_capture_dump = INVALID_HANDLE_VALUE;
+static LONG64 g_capture_dump_frames = 0;
+#define CAPTURE_DUMP_LIMIT (44100LL * 10)
+#define AMB_CAPTURE_SILENCE 0
+#define AMB_CAPTURE_THROTTLE 0
+#define AMB_APP_BUFFER_FRAMES 4096
 
 /* ------------------------------------------------------------------ */
 /* Fake IAudioRenderClient                                             */
@@ -57,15 +65,40 @@ static HRESULT STDMETHODCALLTYPE Render_GetBuffer(IAudioRenderClient* This,
     Stream* s = self->stream;
     if (!s) return E_FAIL;
 
+    for (int attempt = 0; attempt < 500; ++attempt) {
+        EnterCriticalSection(&s->lock);
+        if (!s->fake || !s->staging) {
+            LeaveCriticalSection(&s->lock);
+            return AUDCLNT_E_NOT_INITIALIZED;
+        }
+        if (NumFramesRequested > s->ring.cap_frames) {
+            LeaveCriticalSection(&s->lock);
+            return E_INVALIDARG;
+        }
+
+        BOOL ready = TRUE;
+        if (s->capture && s->started && NumFramesRequested <= s->app_period_frames) {
+            LONG64 submitted = InterlockedCompareExchange64(&s->app_submitted, 0, 0);
+            LONG64 played = Stream_GetAppFramesPlayed(s);
+            LONG64 pending = submitted - played;
+            if (pending < 0) pending = 0;
+            ready = (pending + NumFramesRequested) <= s->app_period_frames;
+        }
+        if (ready) {
+            self->requested = NumFramesRequested;
+            *ppData = s->staging;
+            LeaveCriticalSection(&s->lock);
+            return S_OK;
+        }
+        LeaveCriticalSection(&s->lock);
+        if (s->pace_event) {
+            WaitForSingleObject(s->pace_event, 20);
+        } else {
+            Sleep(1);
+        }
+    }
+
     EnterCriticalSection(&s->lock);
-    if (!s->fake || !s->staging) {
-        LeaveCriticalSection(&s->lock);
-        return AUDCLNT_E_NOT_INITIALIZED;
-    }
-    if (NumFramesRequested > s->ring.cap_frames) {
-        LeaveCriticalSection(&s->lock);
-        return E_INVALIDARG;
-    }
     self->requested = NumFramesRequested;
     *ppData = s->staging;
     LeaveCriticalSection(&s->lock);
@@ -90,6 +123,12 @@ static HRESULT STDMETHODCALLTYPE Render_ReleaseBuffer(IAudioRenderClient* This,
     if (n > self->requested) n = self->requested;
     if (n > s->ring.cap_frames) n = s->ring.cap_frames;
 
+    if (s->capture) {
+        InterlockedExchangeAdd64(&s->app_submitted, (LONG64)n);
+        self->requested = 0;
+        LeaveCriticalSection(&s->lock);
+        return S_OK;
+    }
     if (dwFlags & AUDCLNT_BUFFERFLAGS_SILENT) {
         memset(s->staging, 0, (size_t)n * s->app_fmt.frame_bytes);
     }
@@ -158,6 +197,16 @@ static HRESULT STDMETHODCALLTYPE Clock_GetFrequency(IAudioClock* This, UINT64* p
     FakeClock* self = (FakeClock*)This;
     if (!pFrequency) return E_POINTER;
     *pFrequency = self->stream ? self->stream->app_fmt.rate : 48000;
+    static volatile LONG calls = 0;
+    LONG call = InterlockedIncrement(&calls);
+    if (call <= 8) {
+        LOGI("clock frequency: call=%ld stream=%p capture=%d app=%.0f capture_rate=%.0f freq=%llu",
+             (long)call, (void*)self->stream,
+             self->stream ? self->stream->capture : -1,
+             self->stream ? (double)self->stream->app_fmt.rate : 0.0,
+             self->stream ? (double)self->stream->capture_fmt.rate : 0.0,
+             (unsigned long long)*pFrequency);
+    }
     return S_OK;
 }
 
@@ -166,8 +215,19 @@ static HRESULT STDMETHODCALLTYPE Clock_GetPosition(IAudioClock* This, UINT64* pP
 {
     FakeClock* self = (FakeClock*)This;
     if (!pPosition) return E_POINTER;
-    *pPosition = (UINT64)InterlockedCompareExchange64(&self->stream->frames_played, 0, 0);
+    *pPosition = (UINT64)Stream_GetAppFramesPlayed(self->stream);
     if (pQPCPosition) *pQPCPosition = 0;
+    static volatile LONG calls = 0;
+    LONG call = InterlockedIncrement(&calls);
+    if (call <= 8 || (call % 200) == 0) {
+        LOGI("clock position: call=%ld stream=%p capture=%d position=%llu submitted=%lld app=%.0f capture_rate=%.0f",
+             (long)call, (void*)self->stream,
+             self->stream ? self->stream->capture : -1,
+             (unsigned long long)*pPosition,
+             self->stream ? (long long)InterlockedCompareExchange64(&self->stream->app_submitted, 0, 0) : -1,
+             self->stream ? (double)self->stream->app_fmt.rate : 0.0,
+             self->stream ? (double)self->stream->capture_fmt.rate : 0.0);
+    }
     return S_OK;
 }
 
@@ -589,6 +649,7 @@ Stream* Stream_Get(IAudioClient* client, BOOL create)
         return NULL;
     }
     InitializeCriticalSection(&s->lock);
+    s->pace_event = CreateEventW(NULL, FALSE, FALSE, NULL);
     s->refs = 1;
     s->client = client;
     s->gain = 1.0f;
@@ -638,21 +699,28 @@ void Stream_Release(Stream* s)
 static void Stream_CloseSinkLocked(Stream* s)
 {
     if (s->sink) {
-        if (s->started) s->sink->Stop(s->sink);
+        if (s->sink_started) s->sink->Stop(s->sink);
         s->sink->Close(s->sink);
         free(s->sink);
         s->sink = NULL;
     }
+    s->sink_started = FALSE;
     s->fake = FALSE;
+    s->capture = FALSE;
     s->initialized = FALSE;
     s->started = FALSE;
-    s->period_frames = 0;
+    s->sink_started = FALSE;
+    s->app_period_frames = 0;
+    s->app_submitted = 0;
+    s->app_clock_start.QuadPart = 0;
 }
 
 void Stream_EndFake(Stream* s)
 {
     if (!s) return;
     EnterCriticalSection(&s->lock);
+    LOGI("stream end: %p capture=%d started=%d sink=%p",
+         (void*)s, s->capture ? 1 : 0, s->started ? 1 : 0, (void*)s->sink);
     Stream_CloseSinkLocked(s);
     LeaveCriticalSection(&s->lock);
     AsioHost_CloseIfIdle();
@@ -666,6 +734,7 @@ static void Stream_Destroy(Stream* s)
     free(s->staging);
     s->staging = NULL;
     LeaveCriticalSection(&s->lock);
+    if (s->pace_event) CloseHandle(s->pace_event);
     DeleteCriticalSection(&s->lock);
     free(s);
 }
@@ -673,6 +742,34 @@ static void Stream_Destroy(Stream* s)
 void Stream_Signal(Stream* s)
 {
     if (s && s->app_event) SetEvent(s->app_event);
+}
+
+LONG64 Stream_GetAppFramesPlayed(Stream* s)
+{
+    if (!s) return 0;
+    LONG64 played = InterlockedCompareExchange64(&s->frames_played, 0, 0);
+    if (!s->capture) return played;
+
+    double app_rate = s->app_fmt.rate;
+    double capture_rate = s->capture_fmt.rate;
+    if (app_rate > 0.0 && capture_rate > 0.0) {
+        played = (LONG64)((double)played * app_rate / capture_rate);
+    }
+
+    if (!s->sink_started && s->started && s->app_clock_start.QuadPart != 0 &&
+        app_rate > 0.0) {
+        LARGE_INTEGER now;
+        LARGE_INTEGER freq;
+        QueryPerformanceCounter(&now);
+        QueryPerformanceFrequency(&freq);
+        if (freq.QuadPart > 0) {
+            double seconds = (double)(now.QuadPart - s->app_clock_start.QuadPart) /
+                             (double)freq.QuadPart;
+            LONG64 estimate = (LONG64)(seconds * app_rate);
+            if (estimate > played) played = estimate;
+        }
+    }
+    return played;
 }
 
 void Stream_GetStats(Stream* s, LONG64* frames)
@@ -693,8 +790,11 @@ BOOL Stream_BeginFake(Stream* s, const AmbAudioFormat* fmt, int mode,
 
     s->app_fmt = *fmt;
     s->mode = mode;
+    s->capture = FALSE;
     s->bitperfect = FALSE;
     s->frames_played = 0;
+    s->app_submitted = 0;
+    s->app_clock_start.QuadPart = 0;
     s->gain = 1.0f;
     s->mute = FALSE;
 
@@ -731,10 +831,11 @@ BOOL Stream_BeginFake(Stream* s, const AmbAudioFormat* fmt, int mode,
 
     sink->SetRing(sink, &s->ring);
     s->sink = sink;
-    s->period_frames = period;
+    s->app_period_frames = period;
     s->fake = TRUE;
     s->initialized = TRUE;
     s->started = FALSE;
+    s->sink_started = FALSE;
     s->bitperfect = sink->bitperfect;
 
     LOGI("bridge stream: %s, app buffer %lu frames (%lu bytes/frame), period %lu frames, %s",
@@ -744,6 +845,274 @@ BOOL Stream_BeginFake(Stream* s, const AmbAudioFormat* fmt, int mode,
          s->bitperfect ? "bit-perfect" : "transparent conversion");
     LeaveCriticalSection(&s->lock);
     return TRUE;
+}
+
+BOOL Stream_BeginCapture(Stream* s, const AmbAudioFormat* app_fmt,
+                         const AmbAudioFormat* capture_fmt)
+{
+    if (!s || !app_fmt || !capture_fmt) return FALSE;
+
+    if (g_capture_dump == INVALID_HANDLE_VALUE && g_capture_dump_frames == 0) {
+        wchar_t dump_path[MAX_PATH] = {0};
+        DWORD temp_len = GetTempPathW(MAX_PATH, dump_path);
+        if (temp_len > 0 && temp_len < MAX_PATH) {
+            wcscat_s(dump_path, MAX_PATH, L"AppleMusicASIO-capture.f32");
+            g_capture_dump = CreateFileW(dump_path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                                         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (g_capture_dump != INVALID_HANDLE_VALUE) {
+                LOGI("capture dump: %ls", dump_path);
+            }
+        }
+    }
+
+    EnterCriticalSection(&s->lock);
+    Stream_CloseSinkLocked(s);
+    Ring_Free(&s->ring);
+    free(s->staging);
+    s->staging = NULL;
+
+    s->app_fmt = *app_fmt;
+    s->capture_fmt = *capture_fmt;
+    s->mode = AMB_MODE_ASIO;
+    s->capture = TRUE;
+    s->bitperfect = FALSE;
+    s->frames_played = 0;
+    s->capture_frames = 0;
+    s->app_submitted = 0;
+    s->app_clock_start.QuadPart = 0;
+    s->sink_starting = 0;
+    s->gain = 1.0f;
+    s->mute = FALSE;
+
+    uint32_t period = AMB_APP_BUFFER_FRAMES;
+    uint32_t cap = 1u << 23;
+    if (!Ring_Init(&s->ring, cap, capture_fmt->frame_bytes)) {
+        s->capture = FALSE;
+        LeaveCriticalSection(&s->lock);
+        return FALSE;
+    }
+
+    s->staging = (uint8_t*)calloc(s->ring.cap_frames, app_fmt->frame_bytes);
+    if (!s->staging) {
+        Ring_Free(&s->ring);
+        s->capture = FALSE;
+        LeaveCriticalSection(&s->lock);
+        return FALSE;
+    }
+
+    s->sink = NULL;
+    s->app_period_frames = period;
+    s->fake = TRUE;
+    s->initialized = TRUE;
+    s->started = FALSE;
+    s->sink_started = FALSE;
+    s->bitperfect = FALSE;
+
+    LOGI("capture stream pending: app %.0f Hz / capture %.0f Hz, %lu frames",
+         (double)app_fmt->rate, (double)capture_fmt->rate,
+         (unsigned long)s->ring.cap_frames);
+    LeaveCriticalSection(&s->lock);
+    return TRUE;
+}
+
+BOOL Stream_EnsureCaptureSink(Stream* s)
+{
+    if (!s) return FALSE;
+
+    AmbAudioFormat fmt;
+    EnterCriticalSection(&s->lock);
+    if (!s->capture || s->sink) {
+        LeaveCriticalSection(&s->lock);
+        return s->capture != FALSE;
+    }
+    fmt = s->capture_fmt;
+    LeaveCriticalSection(&s->lock);
+
+    AmbSink* sink = NULL;
+    if (!Sink_AsioCreate(s, &fmt, &sink) || !sink) {
+        return FALSE;
+    }
+
+    EnterCriticalSection(&s->lock);
+    if (!s->capture) {
+        LeaveCriticalSection(&s->lock);
+        sink->Close(sink);
+        free(sink);
+        return FALSE;
+    }
+
+    sink->SetRing(sink, &s->ring);
+    s->sink = sink;
+    s->app_period_frames = AMB_APP_BUFFER_FRAMES;
+    s->bitperfect = sink->bitperfect;
+
+    LeaveCriticalSection(&s->lock);
+    UINT32 fill = 0;
+    for (int i = 0; i < 200; ++i) {
+        EnterCriticalSection(&s->lock);
+        BOOL active = s->capture && s->sink == sink;
+        fill = Ring_Fill(&s->ring);
+        LeaveCriticalSection(&s->lock);
+        if (!active || fill >= 1024) break;
+        Sleep(5);
+    }
+    EnterCriticalSection(&s->lock);
+    if (!s->capture || s->sink != sink) {
+        LeaveCriticalSection(&s->lock);
+        sink->Close(sink);
+        free(sink);
+        return FALSE;
+    }
+    if (fill < 1024) {
+        LOGI("capture: deferred start, prefill %lu frames", (unsigned long)fill);
+        LeaveCriticalSection(&s->lock);
+        return TRUE;
+    }
+    LOGI("capture: prefill %lu frames", (unsigned long)fill);
+    HRESULT hr = sink->Start(sink);
+    if (FAILED(hr)) {
+        LOGW("capture: ASIO start failed 0x%08lx", (unsigned long)hr);
+    } else {
+        s->sink_started = TRUE;
+    }
+
+    LOGI("capture stream started: capture %.0f Hz, period %lu frames, %s",
+         (double)s->capture_fmt.rate, (unsigned long)s->app_period_frames,
+         s->bitperfect ? "bit-perfect" : "transparent conversion");
+    LeaveCriticalSection(&s->lock);
+    return TRUE;
+}
+
+static DWORD WINAPI CaptureSinkThread(void* parameter)
+{
+    Stream* s = (Stream*)parameter;
+    LOGI("capture: ASIO worker start");
+    BOOL ok = Stream_EnsureCaptureSink(s);
+    if (!ok) LOGW("capture: background ASIO setup failed");
+    InterlockedExchange(&s->sink_starting, 0);
+    Stream_Release(s);
+    return 0;
+}
+
+static void RequestCaptureSink(Stream* s)
+{
+    if (!s || !s->capture || s->sink) return;
+    if (InterlockedCompareExchange(&s->sink_starting, 1, 0) != 0) return;
+
+    LOGI("capture: request ASIO sink");
+    Stream_AddRef(s);
+    HANDLE thread = CreateThread(NULL, 0, CaptureSinkThread, s, 0, NULL);
+    if (thread) {
+        CloseHandle(thread);
+    } else {
+        InterlockedExchange(&s->sink_starting, 0);
+        Stream_Release(s);
+    }
+}
+
+BOOL Stream_WriteCapture(Stream* s, const void* data, uint32_t frames)
+{
+    if (!s || !data || !frames) return FALSE;
+    if (s->capture && !s->sink) {
+        RequestCaptureSink(s);
+    }
+    EnterCriticalSection(&s->lock);
+    if (!s->capture || !s->ring.data) {
+        LeaveCriticalSection(&s->lock);
+        return FALSE;
+    }
+#if AMB_CAPTURE_THROTTLE
+    if (s->sink && s->sink_started) {
+        const UINT32 target = 22050;
+        for (int wait = 0; wait < 1000; ++wait) {
+            if (Ring_Fill(&s->ring) + frames <= target) break;
+            Sleep(1);
+        }
+    }
+#endif
+#if AMB_CAPTURE_SILENCE
+    static const float silence[4096 * 2] = {0};
+    UINT32 written = 0;
+    UINT32 remaining = frames;
+    while (remaining > 0) {
+        UINT32 chunk = remaining > 4096 ? 4096 : remaining;
+        UINT32 n = Ring_Write(&s->ring, silence, chunk);
+        written += n;
+        if (n < chunk) break;
+        remaining -= chunk;
+    }
+#else
+    UINT32 written = Ring_Write(&s->ring, data, frames);
+#endif
+    LONG64 total = InterlockedExchangeAdd64(&s->capture_frames, frames) + frames;
+    if (s->capture_fmt.kind == AMB_SAMPLE_F32 && s->capture_fmt.frame_bytes == 8) {
+        const float* samples = (const float*)data;
+        float peak = 0.0f;
+        double sum = 0.0;
+        size_t count = (size_t)frames * 2u;
+        for (size_t i = 0; i < count; ++i) {
+            float v = samples[i];
+            float a = v < 0.0f ? -v : v;
+            if (a > peak) peak = a;
+            sum += (double)v * (double)v;
+        }
+        if (total >= 44100) {
+            static volatile LONG64 meter_next = 44100;
+            if (total >= InterlockedCompareExchange64(&meter_next, 0, 0)) {
+                float rms = (float)sqrt(sum / (double)(count ? count : 1));
+                LOGI("capture level: peak=%.4f rms=%.4f frames=%lld", peak, rms,
+                     (long long)total);
+                if (peak > 1.001f) LOGW("capture level clipping: peak=%.4f", peak);
+                InterlockedExchange64(&meter_next, total + 44100);
+            }
+        }
+    }
+    if (total <= 16384) {
+        LOGI("capture write: %lu frames, total %lld, ring fill %lu",
+             (unsigned long)frames, (long long)total,
+             (unsigned long)Ring_Fill(&s->ring));
+    }
+    AmbSink* start_sink = NULL;
+    if (s->sink && !s->sink_started && Ring_Fill(&s->ring) >= 1024) {
+        s->sink_started = TRUE;
+        start_sink = s->sink;
+        LOGI("capture: starting ASIO after prefill %lu frames",
+             (unsigned long)Ring_Fill(&s->ring));
+    }
+    LeaveCriticalSection(&s->lock);
+
+    if (start_sink) {
+        HRESULT hr = start_sink->Start(start_sink);
+        if (FAILED(hr)) {
+            LOGW("capture: ASIO start failed 0x%08lx", (unsigned long)hr);
+            EnterCriticalSection(&s->lock);
+            if (s->sink == start_sink) s->sink_started = FALSE;
+            LeaveCriticalSection(&s->lock);
+        }
+    }
+
+    if (g_capture_dump != INVALID_HANDLE_VALUE &&
+        g_capture_dump_frames < CAPTURE_DUMP_LIMIT) {
+        DWORD bytes = frames * s->capture_fmt.frame_bytes;
+        DWORD wrote = 0;
+        if (WriteFile(g_capture_dump, data, bytes, &wrote, NULL)) {
+            g_capture_dump_frames += frames;
+        }
+        if (g_capture_dump_frames >= CAPTURE_DUMP_LIMIT) {
+            CloseHandle(g_capture_dump);
+            g_capture_dump = INVALID_HANDLE_VALUE;
+            LOGI("capture dump complete: %lld frames", (long long)g_capture_dump_frames);
+        }
+    }
+
+    if (written < frames) {
+        static volatile LONG warned = 0;
+        if (InterlockedExchange(&warned, 1) == 0) {
+            LOGW("capture ring overflow: wrote %lu of %lu frames",
+                 (unsigned long)written, (unsigned long)frames);
+        }
+    }
+    return written == frames;
 }
 
 IAudioRenderClient* Stream_GetRenderClient(Stream* s)
@@ -806,3 +1175,5 @@ IAudioSessionControl2* Stream_GetSessionControl(Stream* s)
     Stream_AddRef(s);
     return (IAudioSessionControl2*)fs;
 }
+
+

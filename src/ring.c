@@ -6,7 +6,7 @@ BOOL Ring_Init(AmbRing* ring, uint32_t cap_frames, uint32_t frame_bytes)
     ZeroMemory(ring, sizeof(*ring));
 
     uint32_t cap = Amb_NextPow2(cap_frames ? cap_frames : 1024);
-    if (cap > (1u << 20)) cap = 1u << 20;
+    if (cap > (1u << 23)) cap = 1u << 23;
 
     ring->data = (uint8_t*)calloc(cap, frame_bytes);
     if (!ring->data) return FALSE;
@@ -103,3 +103,4 @@ uint32_t Ring_ReadZero(AmbRing* ring, void* dst, uint32_t frames)
     }
     return got;
 }
+

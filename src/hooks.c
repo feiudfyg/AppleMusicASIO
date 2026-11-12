@@ -55,8 +55,23 @@ static int g_ctx_count = 0;
 static HRESULT (STDMETHODCALLTYPE* g_device_activate_orig)(IMMDevice*, REFIID, DWORD,
                                                            PROPVARIANT*, void**);
 static void** g_device_vtbl = NULL;
+static void** g_enum_vtbl = NULL;
 
 static volatile LONG g_mode = AMB_MODE_AUTO;
+static Stream* volatile g_capture_stream = NULL;
+static SRWLOCK g_capture_stream_lock = SRWLOCK_INIT;
+static Stream* volatile g_active_stream = NULL;
+static SRWLOCK g_active_stream_lock = SRWLOCK_INIT;
+
+typedef struct ClientEndpoint {
+    IAudioClient* client;
+    BOOL is_default;
+} ClientEndpoint;
+
+static SRWLOCK g_endpoint_lock = SRWLOCK_INIT;
+static ClientEndpoint g_endpoints[64];
+static int g_endpoint_count = 0;
+static wchar_t g_default_endpoint[256];
 
 static ULONG STDMETHODCALLTYPE Hook_Release(IAudioClient* This);
 static HRESULT STDMETHODCALLTYPE Hook_Initialize(IAudioClient* This, AUDCLNT_SHAREMODE share,
@@ -117,6 +132,218 @@ static void RefreshMode(void)
     }
     InterlockedExchange(&g_mode, effective);
     LOGI("effective mode now: %s", Config_ModeName(effective));
+}
+
+void Hooks_WriteCapture(const void* data, uint32_t frames)
+{
+    AcquireSRWLockShared(&g_capture_stream_lock);
+    Stream* s = (Stream*)g_capture_stream;
+    if (s) Stream_AddRef(s);
+    ReleaseSRWLockShared(&g_capture_stream_lock);
+
+    if (s) {
+        Stream_WriteCapture(s, data, frames);
+        Stream_Release(s);
+    }
+}
+
+typedef struct UnitBuffer {
+    uint32_t channels;
+    uint32_t bytes;
+    void* data;
+} UnitBuffer;
+
+typedef struct UnitBufferList {
+    uint32_t count;
+    UnitBuffer buffers[1];
+} UnitBufferList;
+
+void Hooks_CaptureAudioUnit(void* io_data, uint32_t frames)
+{
+    if (!io_data || !frames) return;
+    UnitBufferList* list = (UnitBufferList*)io_data;
+    if (list->count == 1) {
+        const UnitBuffer* b = &list->buffers[0];
+        if (!b->data || b->bytes < frames * 8u) return;
+        Hooks_WriteCapture(b->data, frames);
+        return;
+    }
+    if (list->count >= 2) {
+        const UnitBuffer* left = &list->buffers[0];
+        const UnitBuffer* right = &list->buffers[1];
+        if (!left->data || !right->data || left->bytes < frames * 4u ||
+            right->bytes < frames * 4u) {
+            return;
+        }
+        static float scratch[32768 * 2];
+        if (frames > 32768) return;
+        const float* l = (const float*)left->data;
+        const float* r = (const float*)right->data;
+        for (uint32_t i = 0; i < frames; ++i) {
+            scratch[i * 2] = l[i];
+            scratch[i * 2 + 1] = r[i];
+        }
+        Hooks_WriteCapture(scratch, frames);
+    }
+}
+
+static void SetCaptureStream(Stream* s)
+{
+    Stream* old = NULL;
+    AcquireSRWLockExclusive(&g_capture_stream_lock);
+    old = (Stream*)g_capture_stream;
+    if (s) Stream_AddRef(s);
+    g_capture_stream = s;
+    ReleaseSRWLockExclusive(&g_capture_stream_lock);
+    if (old) Stream_Release(old);
+}
+
+static void ClearCaptureStream(Stream* s)
+{
+    Stream* old = NULL;
+    AcquireSRWLockExclusive(&g_capture_stream_lock);
+    if ((Stream*)g_capture_stream == s) {
+        old = (Stream*)g_capture_stream;
+        g_capture_stream = NULL;
+    }
+    ReleaseSRWLockExclusive(&g_capture_stream_lock);
+    if (old) Stream_Release(old);
+}
+
+void Hooks_StopCapture(void)
+{
+    Stream* s = NULL;
+    AcquireSRWLockExclusive(&g_capture_stream_lock);
+    s = (Stream*)g_capture_stream;
+    g_capture_stream = NULL;
+    ReleaseSRWLockExclusive(&g_capture_stream_lock);
+    if (!s) return;
+    LOGI("capture stop requested: stream=%p", (void*)s);
+    Stream_EndFake(s);
+    Stream_Release(s);
+}
+
+static void SetActiveStream(Stream* s)
+{
+    Stream* old = NULL;
+    AcquireSRWLockExclusive(&g_active_stream_lock);
+    old = (Stream*)g_active_stream;
+    if (s) Stream_AddRef(s);
+    g_active_stream = s;
+    ReleaseSRWLockExclusive(&g_active_stream_lock);
+    if (old) Stream_Release(old);
+}
+
+static Stream* GetActiveStream(void)
+{
+    Stream* s = NULL;
+    AcquireSRWLockShared(&g_active_stream_lock);
+    s = (Stream*)g_active_stream;
+    if (s) Stream_AddRef(s);
+    ReleaseSRWLockShared(&g_active_stream_lock);
+    return s;
+}
+
+static void ClearActiveStream(Stream* s)
+{
+    Stream* old = NULL;
+    AcquireSRWLockExclusive(&g_active_stream_lock);
+    if ((Stream*)g_active_stream == s) {
+        old = (Stream*)g_active_stream;
+        g_active_stream = NULL;
+    }
+    ReleaseSRWLockExclusive(&g_active_stream_lock);
+    if (old) Stream_Release(old);
+}
+
+void Hooks_SwitchToCapture(void)
+{
+    Stream* s = GetActiveStream();
+    if (!s) return;
+
+    AmbAudioFormat app_fmt;
+    EnterCriticalSection(&s->lock);
+    BOOL already = s->capture;
+    app_fmt = s->app_fmt;
+    LeaveCriticalSection(&s->lock);
+    if (already) {
+        Stream_Release(s);
+        return;
+    }
+
+    WAVEFORMATEXTENSIBLE wfx;
+    AmbAudioFormat capture_fmt;
+    if (!AppHooks_GetCaptureFormat(&wfx.Format, sizeof(wfx)) ||
+        !Format_Parse(&capture_fmt, &wfx.Format)) {
+        Stream_Release(s);
+        return;
+    }
+
+    uint32_t capture_rate = AppHooks_GetSourceRate();
+    if (!capture_rate) capture_rate = (uint32_t)(capture_fmt.rate + 0.5);
+    if (!capture_rate) {
+        Stream_Release(s);
+        return;
+    }
+    Format_Make(&capture_fmt, capture_rate, 2, AMB_SAMPLE_F32, 32);
+    LOGI("bridge: switching active stream to qlac source capture %lu Hz", (unsigned long)capture_rate);
+    Stream_EndFake(s);
+    if (Stream_BeginCapture(s, &app_fmt, &capture_fmt)) {
+        SetCaptureStream(s);
+        if (!Stream_EnsureCaptureSink(s)) {
+            LOGW("bridge: qlac capture ASIO pre-open failed");
+        }
+    }
+    Stream_Release(s);
+}
+
+static void SetClientEndpoint(IAudioClient* client, BOOL is_default)
+{
+    if (!client) return;
+    AcquireSRWLockExclusive(&g_endpoint_lock);
+    for (int i = 0; i < g_endpoint_count; ++i) {
+        if (g_endpoints[i].client == client) {
+            g_endpoints[i].is_default = is_default;
+            ReleaseSRWLockExclusive(&g_endpoint_lock);
+            return;
+        }
+    }
+    if (g_endpoint_count < (int)(sizeof(g_endpoints) / sizeof(g_endpoints[0]))) {
+        g_endpoints[g_endpoint_count].client = client;
+        g_endpoints[g_endpoint_count].is_default = is_default;
+        ++g_endpoint_count;
+    } else {
+        LOGW("endpoint table full; not tracking client %p", (void*)client);
+    }
+    ReleaseSRWLockExclusive(&g_endpoint_lock);
+}
+
+static BOOL ClientIsDefault(IAudioClient* client)
+{
+    if (!client) return FALSE;
+    BOOL found = FALSE;
+    AcquireSRWLockShared(&g_endpoint_lock);
+    for (int i = 0; i < g_endpoint_count; ++i) {
+        if (g_endpoints[i].client == client) {
+            found = g_endpoints[i].is_default;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_endpoint_lock);
+    return found;
+}
+
+static void RemoveClientEndpoint(IAudioClient* client)
+{
+    AcquireSRWLockExclusive(&g_endpoint_lock);
+    for (int i = 0; i < g_endpoint_count; ++i) {
+        if (g_endpoints[i].client == client) {
+            g_endpoints[i] = g_endpoints[g_endpoint_count - 1];
+            --g_endpoint_count;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_endpoint_lock);
 }
 
 static VtblCtx* CtxForObj(void* obj)
@@ -251,6 +478,39 @@ static void InstallDeviceCtx(void** vtbl)
     LOGI("hooked IMMDevice::Activate at %p", (void*)vtbl[3]);
 }
 
+static HRESULT STDMETHODCALLTYPE Hook_RegisterEndpointNotification(
+    IMMDeviceEnumerator* This, IMMNotificationClient* client)
+{
+    AMB_UNUSED(This);
+    LOGI("suppressing endpoint notifications for client %p", (void*)client);
+    return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE Hook_UnregisterEndpointNotification(
+    IMMDeviceEnumerator* This, IMMNotificationClient* client)
+{
+    AMB_UNUSED(This);
+    AMB_UNUSED(client);
+    return S_OK;
+}
+
+static void InstallEnumeratorCtx(void** vtbl)
+{
+    if (!vtbl || g_enum_vtbl) return;
+    g_enum_vtbl = vtbl;
+
+    DWORD old_protect = 0;
+    if (!VirtualProtect(&vtbl[6], 2 * sizeof(void*), PAGE_READWRITE, &old_protect)) {
+        LOGW("VirtualProtect failed for IMMDeviceEnumerator vtable");
+        return;
+    }
+    vtbl[6] = (void*)Hook_RegisterEndpointNotification;
+    vtbl[7] = (void*)Hook_UnregisterEndpointNotification;
+    DWORD ignored = 0;
+    VirtualProtect(&vtbl[6], 2 * sizeof(void*), old_protect, &ignored);
+    LOGI("suppressed IMMDeviceEnumerator endpoint notifications");
+}
+
 static HRESULT BeginBridge(Stream* s, VtblCtx* c, const WAVEFORMATEX* pFormat)
 {
     AmbAudioFormat fmt;
@@ -259,10 +519,48 @@ static HRESULT BeginBridge(Stream* s, VtblCtx* c, const WAVEFORMATEX* pFormat)
         return E_INVALIDARG;
     }
     RealClientFns fns = MakeFns(c);
+    SetCaptureStream(NULL);
 
     AmbMode mode = CurrentMode();
+    uint32_t source_codec = AppHooks_GetSourceCodec();
+    BOOL qaac_prelude = source_codec == 0x71616163u;
+    if (mode == AMB_MODE_ASIO && g_cfg.follow_source_rate && qaac_prelude) {
+        LOGI("bridge: qaac prelude; using normal ASIO/resampling until qlac");
+    } else if (mode == AMB_MODE_ASIO && g_cfg.follow_source_rate) {
+        WAVEFORMATEXTENSIBLE capture_wfx;
+        AmbAudioFormat capture_fmt;
+        BOOL have_capture = AppHooks_GetCaptureFormat(&capture_wfx.Format,
+                                                      sizeof(capture_wfx)) &&
+                            Format_Parse(&capture_fmt, &capture_wfx.Format);
+        if (have_capture) {
+            uint32_t source_rate = AppHooks_GetSourceRate();
+            if (source_rate && source_rate != capture_fmt.rate) {
+                LOGI("bridge: using source rate %lu Hz for capture instead of %lu Hz",
+                     (unsigned long)source_rate, (unsigned long)capture_fmt.rate);
+                capture_fmt.rate = source_rate;
+            }
+            if (capture_fmt.rate != fmt.rate) {
+                LOGI("bridge: source capture format differs from endpoint (%lu -> %lu Hz)",
+                     (unsigned long)fmt.rate, (unsigned long)capture_fmt.rate);
+            }
+            if (Stream_BeginCapture(s, &fmt, &capture_fmt)) {
+                /* Publish the capture stream before waiting for prefill.
+                   The tap callbacks are the only producer for this ring. */
+                SetCaptureStream(s);
+                if (!Stream_EnsureCaptureSink(s)) {
+                    LOGW("bridge: capture ASIO pre-open failed");
+                }
+                SetActiveStream(s);
+                LOGI("bridge: ASIO AudioUnit capture stream active (%s)",
+                     s->bitperfect ? "bit-perfect" : "transparent format conversion");
+                return S_OK;
+            }
+        }
+        LOGW("bridge: capture sink setup failed; using normal ASIO path");
+    }
     if (mode == AMB_MODE_ASIO) {
         if (Stream_BeginFake(s, &fmt, AMB_MODE_ASIO, &fns)) {
+            SetActiveStream(s);
             LOGI("bridge: ASIO stream active (%s)",
                  s->bitperfect ? "bit-perfect" : "transparent format conversion");
             return S_OK;
@@ -272,6 +570,7 @@ static HRESULT BeginBridge(Stream* s, VtblCtx* c, const WAVEFORMATEX* pFormat)
     }
     if (mode == AMB_MODE_EXCLUSIVE) {
         if (Stream_BeginFake(s, &fmt, AMB_MODE_EXCLUSIVE, &fns)) {
+            SetActiveStream(s);
             LOGI("bridge: WASAPI exclusive stream active (%s)",
                  s->bitperfect ? "bit-perfect" : "transparent format conversion");
             return S_OK;
@@ -296,6 +595,14 @@ static ULONG STDMETHODCALLTYPE Hook_Release(IAudioClient* This)
     ULONG refs = orig((IUnknown*)This);
     if (refs == 0) {
         LOGD("IAudioClient released");
+        Stream* s = Stream_Get(This, FALSE);
+        if (s && s->capture) {
+            LOGI("capture client released: %p started=%d sink=%p",
+                 (void*)s, s->started ? 1 : 0, (void*)s->sink);
+        }
+        ClearCaptureStream(s);
+        ClearActiveStream(s);
+        RemoveClientEndpoint(This);
         Stream_Remove(This);
     }
     return refs;
@@ -341,29 +648,10 @@ static HRESULT STDMETHODCALLTYPE Hook_GetMixFormat(IAudioClient* This, WAVEFORMA
 
     RefreshMode();
     LogFormat("GetMixFormat (device)", *format);
-    if (CurrentMode() == AMB_MODE_MONITOR || CurrentMode() == AMB_MODE_OFF) return hr;
 
-    uint32_t source_rate = AppHooks_GetSourceRate();
-    AmbMode mode = CurrentMode();
-    if (g_cfg.follow_source_rate &&
-        (mode == AMB_MODE_ASIO || mode == AMB_MODE_EXCLUSIVE) && source_rate &&
-        (uint32_t)(*format)->nSamplesPerSec != source_rate &&
-        IsSupportedSourceRate(source_rate) && IsFloatFormat(*format)) {
-        DWORD bytes = sizeof(WAVEFORMATEX) + (*format)->cbSize;
-        WAVEFORMATEX* copy = (WAVEFORMATEX*)CoTaskMemAlloc(bytes);
-        if (copy) {
-            memcpy(copy, *format, bytes);
-            copy->nSamplesPerSec = source_rate;
-            copy->nAvgBytesPerSec = source_rate * copy->nBlockAlign;
-            LOGI("GetMixFormat: following source rate %u Hz (device was %u Hz)",
-                 source_rate, (unsigned)(*format)->nSamplesPerSec);
-            CoTaskMemFree(*format);
-            *format = copy;
-        }
-    }
-
-    /* Never open ASIO here.  Apple Music probes the device with short-lived
-       clients; the sink negotiates its real format at Initialize. */
+    /* Endpoint formats are never rewritten.  With capture mode the real
+       device format keeps Apple's graph stable; decoded PCM is captured at
+       the CoreAudio converter and sent to ASIO at its native rate. */
     return hr;
 }
 
@@ -404,14 +692,6 @@ static HRESULT STDMETHODCALLTYPE Hook_IsFormatSupported(IAudioClient* This,
         }
     }
 
-    uint32_t source_rate = AppHooks_GetSourceRate();
-    if (!s && g_cfg.follow_source_rate && mode == AMB_MODE_ASIO &&
-        share == AUDCLNT_SHAREMODE_SHARED && format && source_rate &&
-        (uint32_t)format->nSamplesPerSec == source_rate && IsFloatFormat(format)) {
-        if (closest) *closest = NULL;
-        return S_OK;
-    }
-
     return orig(This, share, format, closest);
 }
 
@@ -437,9 +717,15 @@ static HRESULT STDMETHODCALLTYPE Hook_Initialize(IAudioClient* This, AUDCLNT_SHA
     if (mode == AMB_MODE_MONITOR || mode == AMB_MODE_OFF || !parsed) {
         return orig(This, share, flags, buffer_duration, periodicity, format, session);
     }
-
+    if (g_cfg.follow_source_rate && !ClientIsDefault(This)) {
+        LOGD("Initialize: non-default endpoint; forwarding");
+        return orig(This, share, flags, buffer_duration, periodicity, format, session);
+    }
     Stream* s = Stream_Get(This, TRUE);
-    if (!s) return orig(This, share, flags, buffer_duration, periodicity, format, session);
+    if (!s) {
+        LOGW("bridge: stream table full or allocation failed; forwarding");
+        return orig(This, share, flags, buffer_duration, periodicity, format, session);
+    }
 
     if (s->fake) Stream_EndFake(s);
     HRESULT hr = BeginBridge(s, c, format);
@@ -457,7 +743,14 @@ static HRESULT STDMETHODCALLTYPE Hook_GetBufferSize(IAudioClient* This, UINT32* 
     Stream* s = Stream_Get(This, FALSE);
     if (s && s->fake) {
         if (!frames) return E_POINTER;
-        *frames = s->ring.cap_frames;
+        *frames = s->capture ? s->app_period_frames : s->ring.cap_frames;
+        static volatile LONG calls = 0;
+        LONG call = InterlockedIncrement(&calls);
+        if (call <= 12) {
+            LOGI("GetBufferSize: call=%ld stream=%p capture=%d frames=%lu app=%.0f capture_rate=%.0f",
+                 (long)call, (void*)s, s->capture ? 1 : 0, (unsigned long)*frames,
+                 (double)s->app_fmt.rate, (double)s->capture_fmt.rate);
+        }
         return S_OK;
     }
     return ((PFN_GetBufferSize)c->orig[4])(This, frames);
@@ -470,7 +763,14 @@ static HRESULT STDMETHODCALLTYPE Hook_GetStreamLatency(IAudioClient* This, REFER
     Stream* s = Stream_Get(This, FALSE);
     if (s && s->fake) {
         if (!latency) return E_POINTER;
-        *latency = (REFERENCE_TIME)s->period_frames * 10000000 / s->app_fmt.rate;
+        *latency = (REFERENCE_TIME)s->app_period_frames * 10000000 / s->app_fmt.rate;
+        static volatile LONG calls = 0;
+        LONG call = InterlockedIncrement(&calls);
+        if (call <= 12) {
+            LOGI("GetStreamLatency: call=%ld stream=%p capture=%d latency=%lld app=%.0f capture_rate=%.0f",
+                 (long)call, (void*)s, s->capture ? 1 : 0, (long long)*latency,
+                 (double)s->app_fmt.rate, (double)s->capture_fmt.rate);
+        }
         return S_OK;
     }
     return ((PFN_GetStreamLatency)c->orig[5])(This, latency);
@@ -483,7 +783,25 @@ static HRESULT STDMETHODCALLTYPE Hook_GetCurrentPadding(IAudioClient* This, UINT
     Stream* s = Stream_Get(This, FALSE);
     if (s && s->fake) {
         if (!padding) return E_POINTER;
-        *padding = Ring_Fill(&s->ring);
+        if (!s->capture) {
+            *padding = Ring_Fill(&s->ring);
+            return S_OK;
+        }
+
+        LONG64 submitted = InterlockedCompareExchange64(&s->app_submitted, 0, 0);
+        LONG64 played = Stream_GetAppFramesPlayed(s);
+        LONG64 pending = submitted - played;
+        if (pending < 0) pending = 0;
+        if (pending > s->app_period_frames) pending = s->app_period_frames;
+        *padding = (UINT32)pending;
+        static volatile LONG calls = 0;
+        LONG call = InterlockedIncrement(&calls);
+        if (call <= 12 || (call % 500) == 0) {
+            LOGI("padding: call=%ld stream=%p submitted=%lld played=%lld pending=%lu period=%lu started=%d sink=%d",
+                 (long)call, (void*)s, (long long)submitted, (long long)played,
+                 (unsigned long)*padding, (unsigned long)s->app_period_frames,
+                 s->started ? 1 : 0, s->sink_started ? 1 : 0);
+        }
         return S_OK;
     }
     return ((PFN_GetCurrentPadding)c->orig[6])(This, padding);
@@ -497,9 +815,16 @@ static HRESULT STDMETHODCALLTYPE Hook_GetDevicePeriod(IAudioClient* This,
     if (!c) return E_FAIL;
     Stream* s = Stream_Get(This, FALSE);
     if (s && s->fake) {
-        REFERENCE_TIME t = (REFERENCE_TIME)s->period_frames * 10000000 / s->app_fmt.rate;
+        REFERENCE_TIME t = (REFERENCE_TIME)s->app_period_frames * 10000000 / s->app_fmt.rate;
         if (default_period) *default_period = t;
         if (min_period) *min_period = t;
+        static volatile LONG calls = 0;
+        LONG call = InterlockedIncrement(&calls);
+        if (call <= 12) {
+            LOGI("GetDevicePeriod: call=%ld stream=%p capture=%d period=%lld app=%.0f capture_rate=%.0f",
+                 (long)call, (void*)s, s->capture ? 1 : 0, (long long)t,
+                 (double)s->app_fmt.rate, (double)s->capture_fmt.rate);
+        }
         return S_OK;
     }
     return ((PFN_GetDevicePeriod)c->orig[9])(This, default_period, min_period);
@@ -512,10 +837,21 @@ static HRESULT STDMETHODCALLTYPE Hook_Start(IAudioClient* This)
     Stream* s = Stream_Get(This, FALSE);
     if (s && s->fake) {
         if (s->started) return S_OK;
-        if (!s->sink) return AUDCLNT_E_NOT_INITIALIZED;
+        if (s->capture) {
+            s->app_submitted = 0;
+            QueryPerformanceCounter(&s->app_clock_start);
+            s->started = TRUE;
+            Stream_Signal(s);
+            if (s->pace_event) SetEvent(s->pace_event);
+            return S_OK;
+        }
+        if (!s->sink) {
+            return AUDCLNT_E_NOT_INITIALIZED;
+        }
         HRESULT hr = s->sink->Start(s->sink);
         if (SUCCEEDED(hr)) {
             s->started = TRUE;
+            s->sink_started = TRUE;
             Stream_Signal(s);
         }
         return hr;
@@ -529,8 +865,17 @@ static HRESULT STDMETHODCALLTYPE Hook_Stop(IAudioClient* This)
     if (!c) return E_FAIL;
     Stream* s = Stream_Get(This, FALSE);
     if (s && s->fake) {
+        if (s->capture) {
+            s->started = FALSE;
+            s->app_submitted = 0;
+            s->app_clock_start.QuadPart = 0;
+            Stream_Signal(s);
+            if (s->pace_event) SetEvent(s->pace_event);
+            return S_OK;
+        }
         if (s->started && s->sink) s->sink->Stop(s->sink);
         s->started = FALSE;
+        s->sink_started = FALSE;
         Stream_Signal(s);
         return S_OK;
     }
@@ -543,8 +888,17 @@ static HRESULT STDMETHODCALLTYPE Hook_Reset(IAudioClient* This)
     if (!c) return E_FAIL;
     Stream* s = Stream_Get(This, FALSE);
     if (s && s->fake) {
+        if (s->capture) {
+            s->started = FALSE;
+            s->app_submitted = 0;
+            s->app_clock_start.QuadPart = 0;
+            Stream_Signal(s);
+            if (s->pace_event) SetEvent(s->pace_event);
+            return S_OK;
+        }
         if (s->started && s->sink) s->sink->Stop(s->sink);
         s->started = FALSE;
+        s->sink_started = FALSE;
         Ring_Clear(&s->ring);
         s->frames_played = 0;
         Stream_Signal(s);
@@ -646,7 +1000,7 @@ static HRESULT STDMETHODCALLTYPE Hook_GetBufferSizeLimits(IAudioClient* This,
     AMB_UNUSED(event_driven);
     Stream* s = Stream_Get(This, FALSE);
     if (s && s->fake) {
-        REFERENCE_TIME t = (REFERENCE_TIME)s->period_frames * 10000000 / s->app_fmt.rate;
+        REFERENCE_TIME t = (REFERENCE_TIME)s->app_period_frames * 10000000 / s->app_fmt.rate;
         if (min_duration) *min_duration = t;
         if (max_duration) *max_duration = t * 32;
         return S_OK;
@@ -667,10 +1021,10 @@ static HRESULT STDMETHODCALLTYPE Hook_GetSharedModeEnginePeriod(IAudioClient* Th
     AMB_UNUSED(format);
     Stream* s = Stream_Get(This, FALSE);
     if (s && s->fake) {
-        if (default_period) *default_period = s->period_frames;
-        if (fundamental_period) *fundamental_period = s->period_frames;
-        if (min_period) *min_period = s->period_frames;
-        if (max_period) *max_period = s->period_frames;
+        if (default_period) *default_period = s->app_period_frames;
+        if (fundamental_period) *fundamental_period = s->app_period_frames;
+        if (min_period) *min_period = s->app_period_frames;
+        if (max_period) *max_period = s->app_period_frames;
         return S_OK;
     }
     return ((PFN_GetSharedModeEnginePeriod)c->orig[18])(This, format, default_period,
@@ -688,7 +1042,7 @@ static HRESULT STDMETHODCALLTYPE Hook_GetCurrentSharedModeEnginePeriod(IAudioCli
     LOGD("GetCurrentSharedModeEnginePeriod (fake=%d)", s && s->fake);
     if (s && s->fake) {
         if (format) *format = Format_AllocCo(&s->app_fmt);
-        if (frames) *frames = s->period_frames;
+        if (frames) *frames = s->app_period_frames;
         return S_OK;
     }
     return ((PFN_GetCurrentSharedModeEnginePeriod)c->orig[19])(This, format, frames);
@@ -710,7 +1064,6 @@ static HRESULT STDMETHODCALLTYPE Hook_InitializeSharedAudioStream(IAudioClient* 
         return ((PFN_InitializeSharedAudioStream)c->orig[20])(This, flags, period_frames,
                                                              format, session);
     }
-
     Stream* s = Stream_Get(This, TRUE);
     if (!s) {
         return ((PFN_InitializeSharedAudioStream)c->orig[20])(This, flags, period_frames,
@@ -759,12 +1112,17 @@ static HRESULT STDMETHODCALLTYPE Hook_Activate(IMMDevice* This, REFIID iid, DWOR
         InstallClientCtx(*(void***)*ppv, has2, has3);
 
         LPWSTR device_id = NULL;
+        BOOL is_default = FALSE;
         if (SUCCEEDED(This->lpVtbl->GetId(This, &device_id)) && device_id) {
+            is_default = g_default_endpoint[0] &&
+                         _wcsicmp(device_id, g_default_endpoint) == 0;
             wchar_t iid_text[64];
             LogIid(iid, iid_text, 64);
-            LOGI("IMMDevice::Activate %ls -> %ls", iid_text, device_id);
+            LOGI("IMMDevice::Activate %ls -> %ls%s", iid_text, device_id,
+                 is_default ? " [default]" : "");
             CoTaskMemFree(device_id);
         }
+        SetClientEndpoint((IAudioClient*)*ppv, is_default);
     }
     return hr;
 }
@@ -795,11 +1153,22 @@ BOOL Hooks_Install(void)
         LOGE("MMDeviceEnumerator creation failed (hr=0x%08lx)", (unsigned long)hr);
         return FALSE;
     }
+    InstallEnumeratorCtx(*(void***)enumerator);
     hr = enumerator->lpVtbl->GetDefaultAudioEndpoint(enumerator, eRender, eConsole, &device);
     if (FAILED(hr) || !device) {
         LOGE("no default render endpoint (hr=0x%08lx)", (unsigned long)hr);
         enumerator->lpVtbl->Release(enumerator);
         return FALSE;
+    }
+    LPWSTR default_id = NULL;
+    if (SUCCEEDED(device->lpVtbl->GetId(device, &default_id)) && default_id) {
+        wcsncpy_s(g_default_endpoint,
+                  sizeof(g_default_endpoint) / sizeof(g_default_endpoint[0]),
+                  default_id, _TRUNCATE);
+        LOGI("default render endpoint: %ls", g_default_endpoint);
+        CoTaskMemFree(default_id);
+    } else {
+        LOGW("default render endpoint has no id; bridge will not fake device format");
     }
     hr = device->lpVtbl->Activate(device, &IID_IAudioClient, CLSCTX_INPROC_SERVER, NULL,
                                   (void**)&client);

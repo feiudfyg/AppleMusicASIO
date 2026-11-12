@@ -22,6 +22,7 @@ typedef struct AsioConsumer {
     UINT32 frame_bytes;
     UINT32 channels;
     HANDLE* event;
+    HANDLE* pace_event;
     volatile LONG64* frames_played;
     volatile float* gain;
     volatile BOOL* mute;
