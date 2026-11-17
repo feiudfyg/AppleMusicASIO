@@ -475,6 +475,22 @@ BOOL Setup_SetMode(const wchar_t* mode)
     return WriteRegString(HKEY_CURRENT_USER, AMB_SETUP_KEY, L"Mode", mode);
 }
 
+BOOL Setup_GetDevice(wchar_t* device, size_t count)
+{
+    if (!device || !count) return FALSE;
+    if (!ReadRegString(HKEY_CURRENT_USER, AMB_SETUP_KEY, L"Device", device,
+                       (DWORD)count, NULL)) {
+        device[0] = 0;
+    }
+    return device[0] != 0;
+}
+
+BOOL Setup_SetDevice(const wchar_t* device)
+{
+    if (!device || !*device) return FALSE;
+    return WriteRegString(HKEY_CURRENT_USER, AMB_SETUP_KEY, L"Device", device);
+}
+
 static void UnregisterInprocServer(const wchar_t* key, const wchar_t* root,
                                    const wchar_t* dll)
 {
@@ -502,6 +518,66 @@ static void UnregisterEarlyProxy(void)
     UnregisterInprocServer(AMB_EARLY_CLSID_KEY, AMB_EARLY_CLSID_ROOT, early);
 }
 
+static BOOL CopyInstallerPackage(const wchar_t* source_dir)
+{
+    wchar_t package[MAX_PATH];
+    wcsncpy_s(package, MAX_PATH, Setup_InstallDir(), _TRUNCATE);
+    SHCreateDirectoryExW(NULL, package, NULL);
+
+    const wchar_t* files[] = {
+        L"AMAudioBridgeSetup.exe", L"AMAudioBridge.dll", L"AMVerifierShim.dll",
+        L"AMPrefsPersist.dll", L"AMAudioBridge.ini", L"README.md", L"LICENSE"
+    };
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); ++i) {
+        wchar_t src[MAX_PATH], dst[MAX_PATH];
+        _snwprintf_s(src, MAX_PATH, _TRUNCATE, L"%s\\%s", source_dir, files[i]);
+        if (GetFileAttributesW(src) == INVALID_FILE_ATTRIBUTES) continue;
+        _snwprintf_s(dst, MAX_PATH, _TRUNCATE, L"%s\\%s", package, files[i]);
+        if (!_wcsicmp(src, dst)) continue;
+        if (!_wcsicmp(files[i], L"AMAudioBridge.ini") &&
+            GetFileAttributesW(dst) != INVALID_FILE_ATTRIBUTES) {
+            continue;
+        }
+        if (!CopyFileW(src, dst, FALSE) && GetLastError() != ERROR_FILE_EXISTS) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static BOOL CreateDesktopShortcut(void)
+{
+    wchar_t package[MAX_PATH], exe[MAX_PATH], desktop[MAX_PATH], link_path[MAX_PATH];
+    wcsncpy_s(package, MAX_PATH, Setup_InstallDir(), _TRUNCATE);
+    _snwprintf_s(exe, MAX_PATH, _TRUNCATE, L"%s\\AMAudioBridgeSetup.exe", package);
+    wchar_t public_dir[MAX_PATH] = L"C:\\Users\\Public";
+    DWORD n = GetEnvironmentVariableW(L"PUBLIC", public_dir, MAX_PATH);
+    if (!n || n >= MAX_PATH) {
+        wcsncpy_s(public_dir, MAX_PATH, L"C:\\Users\\Public", _TRUNCATE);
+    }
+    _snwprintf_s(desktop, MAX_PATH, _TRUNCATE, L"%s\\Desktop", public_dir);
+    _snwprintf_s(link_path, MAX_PATH, _TRUNCATE, L"%s\\Apple Music ASIO.lnk", desktop);
+
+    IShellLinkW* link = NULL;
+    HRESULT hr = CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER,
+                                  &IID_IShellLinkW, (void**)&link);
+    if (FAILED(hr) || !link) return FALSE;
+
+    link->lpVtbl->SetPath(link, exe);
+    link->lpVtbl->SetWorkingDirectory(link, package);
+    link->lpVtbl->SetIconLocation(link, exe, 0);
+    link->lpVtbl->SetDescription(link, L"Apple Music ASIO setup and output settings");
+
+    IPersistFile* file = NULL;
+    hr = link->lpVtbl->QueryInterface(link, &IID_IPersistFile, (void**)&file);
+    if (SUCCEEDED(hr) && file) {
+        hr = file->lpVtbl->Save(file, link_path, TRUE);
+        file->lpVtbl->Release(file);
+    }
+    link->lpVtbl->Release(link);
+    return SUCCEEDED(hr);
+}
+
 BOOL Setup_Install(const wchar_t* mode, wchar_t* message, size_t count)
 {
     wchar_t source[MAX_PATH];
@@ -523,6 +599,12 @@ BOOL Setup_Install(const wchar_t* mode, wchar_t* message, size_t count)
         }
     }
 
+    if (!CopyInstallerPackage(source)) {
+        SetMessage(message, count, L"Could not copy the setup package to the install folder.");
+        return FALSE;
+    }
+    CreateDesktopShortcut();
+
     if (!Verifier_Install(source, message, count)) return FALSE;
 
     for (size_t i = 1; i < sizeof(files) / sizeof(files[0]); ++i) {
@@ -530,6 +612,10 @@ BOOL Setup_Install(const wchar_t* mode, wchar_t* message, size_t count)
         _snwprintf_s(src, MAX_PATH, _TRUNCATE, L"%s\\%s", source, files[i]);
         _snwprintf_s(dst, MAX_PATH, _TRUNCATE, L"%s\\%s", Setup_InstallDir(), files[i]);
         if (!_wcsicmp(src, dst)) continue;
+        if (!_wcsicmp(files[i], L"AMAudioBridge.ini") &&
+            GetFileAttributesW(dst) != INVALID_FILE_ATTRIBUTES) {
+            continue;
+        }
         DWORD error = 0;
         if (!ReplaceFileIfNeeded(src, dst, &error) && error != ERROR_FILE_EXISTS) {
             SetMessage(message, count,

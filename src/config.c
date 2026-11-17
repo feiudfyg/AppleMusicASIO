@@ -12,7 +12,8 @@ AmbConfig g_cfg = {
     0,
     20,
     10,
-    FALSE
+    FALSE,
+    L""
 };
 
 static wchar_t g_ini_path[MAX_PATH] = L"";
@@ -50,6 +51,22 @@ static BOOL ReadRegistryMode(AmbMode* out)
     text[(sizeof(text) / sizeof(text[0])) - 1] = 0;
     *out = ParseMode(text);
     return TRUE;
+}
+
+static BOOL ReadRegistryDevice(wchar_t* out, DWORD count)
+{
+    HKEY key = NULL;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\AppleMusicASIO", 0,
+                      KEY_READ | KEY_WOW64_64KEY, &key) != ERROR_SUCCESS) {
+        return FALSE;
+    }
+    DWORD bytes = count * sizeof(wchar_t);
+    DWORD type = 0;
+    LONG rc = RegQueryValueExW(key, L"Device", NULL, &type, (BYTE*)out, &bytes);
+    RegCloseKey(key);
+    if (rc != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ)) return FALSE;
+    out[count - 1] = 0;
+    return out[0] != 0;
 }
 
 static void IniGetString(const wchar_t* section, const wchar_t* key,
@@ -113,6 +130,20 @@ void Config_Load(void)
     g_cfg.wasapi_buffer_ms = IniGetInt(L"WASAPI", L"BufferMs", 20);
     if (g_cfg.wasapi_buffer_ms < 4) g_cfg.wasapi_buffer_ms = 4;
 
+    g_cfg.wasapi_device[0] = 0;
+    wchar_t device[512];
+    if (ReadRegistryDevice(device, 512)) {
+        if (!_wcsnicmp(device, L"wasapi:", 7)) {
+            g_cfg.mode = AMB_MODE_EXCLUSIVE;
+            wcsncpy_s(g_cfg.wasapi_device, 512, device + 7, _TRUNCATE);
+            wcsncpy_s(g_cfg.asio_driver, 128, L"auto", _TRUNCATE);
+        } else if (!_wcsnicmp(device, L"asio:", 5)) {
+            g_cfg.mode = AMB_MODE_ASIO;
+            wcsncpy_s(g_cfg.asio_driver, 128, device + 5, _TRUNCATE);
+            g_cfg.wasapi_device[0] = 0;
+        }
+    }
+
     Log_SetLevel(g_cfg.log_level);
     LOGI("config: %ls", g_ini_path[0] ? g_ini_path : L"(defaults)");
     LOGI("config: mode=%s log=%d strict=%d volume=%s driver=%ls channels=%d buffer=%d rate=%d wasapi_buf=%dms follow_source=%d",
@@ -122,6 +153,8 @@ void Config_Load(void)
          g_cfg.asio_driver, g_cfg.asio_channels, g_cfg.asio_buffer_frames,
          g_cfg.asio_rate, g_cfg.wasapi_buffer_ms,
          g_cfg.follow_source_rate ? 1 : 0);
+    LOGI("config: selected device=%ls",
+         g_cfg.mode == AMB_MODE_ASIO ? g_cfg.asio_driver : g_cfg.wasapi_device);
 
     WIN32_FILE_ATTRIBUTE_DATA fad;
     if (g_ini_path[0] && GetFileAttributesExW(g_ini_path, GetFileExInfoStandard, &fad)) {

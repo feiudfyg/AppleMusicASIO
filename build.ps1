@@ -88,17 +88,11 @@ Build-Target 'prefsprobe' @('src\prefs_probe.c') ('/DLL /OUT:' + (Join-Path $out
 Build-Target 'prefspersist' @('src\prefs_probe.c') ('/DLL /OUT:' + (Join-Path $out 'AMPrefsPersist.dll') +
     ' ole32.lib uuid.lib /LTCG') @('/O1', '/GL')
 
-Build-Target 'earlyproxy' @('src\early_proxy.c', 'src\log.c') ('/DLL /OUT:' + (Join-Path $out 'AMEarlyProxy.dll') +
-    ' /EXPORT:DllGetClassObject,PRIVATE /EXPORT:DllCanUnloadNow,PRIVATE ole32.lib advapi32.lib /LTCG') @('/O1', '/GL')
-
 Build-Target 'verifiershim' @('src\verifier_shim.c') ('/DLL /OUT:' + (Join-Path $out 'AMVerifierShim.dll') +
     ' advapi32.lib bcrypt.lib /LTCG') @('/O1', '/GL', '/I', $out)
 
-Build-Target 'setup' @('src\setup.c', 'src\setup_common.c', 'src\verifier_install.c') ('/SUBSYSTEM:WINDOWS /OUT:' + (Join-Path $out 'AMAudioBridgeSetup.exe') +
-    ' user32.lib gdi32.lib shell32.lib advapi32.lib bcrypt.lib /LTCG') @('/O1', '/GL')
-
-Build-Target 'injector' @('src\injector.c') ('/OUT:' + (Join-Path $out 'AMAudioBridgeInjector.exe') +
-    ' ole32.lib uuid.lib advapi32.lib')
+Build-Target 'setup' @('src\setup.c', 'src\setup_common.c', 'src\verifier_install.c', 'src\format.c', 'src\guids.c') ('/SUBSYSTEM:WINDOWS /OUT:' + (Join-Path $out 'AMAudioBridgeSetup.exe') +
+    ' user32.lib gdi32.lib shell32.lib advapi32.lib bcrypt.lib ole32.lib uuid.lib propsys.lib /LTCG') @('/O1', '/GL')
 
 Copy-Item (Join-Path $root 'AMAudioBridge.ini') (Join-Path $out 'AMAudioBridge.ini') -Force
 

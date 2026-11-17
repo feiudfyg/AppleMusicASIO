@@ -14,6 +14,7 @@ typedef struct AmbConfig {
     int wasapi_buffer_ms;
     int device_poll_ms;
     BOOL follow_source_rate;
+    wchar_t wasapi_device[512];
 } AmbConfig;
 
 extern AmbConfig g_cfg;

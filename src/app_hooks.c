@@ -163,6 +163,7 @@ static int g_capture_count = 0;
 static AmbAudioFormat g_capture_format;
 static BOOL g_have_capture_format = FALSE;
 static float g_capture_scratch[AMB_CAPTURE_SCRATCH_FRAMES * 2];
+static void* volatile g_normal_queue = NULL;
 
 static OSStatus CapturedRenderCallback(void* ref, uint32_t* flags, const void* timestamp,
                                        uint32_t bus, uint32_t frames, void* io_data);
@@ -796,7 +797,12 @@ static OSStatus Hook_AudioQueueStop(void* queue, uint32_t immediate)
     if (tap && tap->queue == queue) {
         InterlockedExchangePointer((PVOID volatile*)&g_active_tap, NULL);
         InterlockedExchange(&g_tap_active, 0);
+        InterlockedExchangePointer((PVOID volatile*)&g_normal_queue, NULL);
         Hooks_StopCapture();
+    } else if (InterlockedCompareExchangePointer(
+                   (PVOID volatile*)&g_normal_queue, NULL, NULL) == queue) {
+        InterlockedExchangePointer((PVOID volatile*)&g_normal_queue, NULL);
+        Hooks_StopNormalStream();
     }
     OSStatus result = g_queue_stop ? g_queue_stop(queue, immediate) : -1;
     LOGI("AudioQueueStop: exit queue=%p result=%ld immediate=%lu active_tap_queue=%p tid=%lu",
@@ -814,24 +820,34 @@ static DWORD WINAPI CaptureSwitchThread(void* parameter)
 
 static OSStatus Hook_AudioQueueStart(void* queue, const void* start_time)
 {
+    TapCtx* tap_ctx = NULL;
+    LONG count = InterlockedCompareExchange(&g_tap_ctx_count, 0, 0);
+    for (LONG i = 0; i < count && i < (LONG)(sizeof(g_tap_ctxs) / sizeof(g_tap_ctxs[0])); ++i) {
+        TapCtx* ctx = (TapCtx*)InterlockedCompareExchangePointer(
+            (PVOID volatile*)&g_tap_ctxs[i], NULL, NULL);
+        if (ctx && ctx->queue == queue) {
+            tap_ctx = ctx;
+            break;
+        }
+    }
+
+    /* Put the capture endpoint in place before Apple starts the queue clock.
+       During a seek this keeps the old position silent until audio is ready. */
+    BOOL prepared = tap_ctx ? Hooks_SwitchToCapture() : FALSE;
     OSStatus result = g_queue_start ? g_queue_start(queue, start_time) : -1;
-    if (result == 0) {
-        LONG count = InterlockedCompareExchange(&g_tap_ctx_count, 0, 0);
-        for (LONG i = 0; i < count && i < (LONG)(sizeof(g_tap_ctxs) / sizeof(g_tap_ctxs[0])); ++i) {
-            TapCtx* ctx = (TapCtx*)InterlockedCompareExchangePointer(
-                (PVOID volatile*)&g_tap_ctxs[i], NULL, NULL);
-            if (ctx && ctx->queue == queue) {
-                InterlockedExchange(&ctx->started, 1);
-                LOGI("AudioQueueStart: qlac tap queue=%p", queue);
-                if (InterlockedCompareExchange(&g_switch_pending, 1, 0) == 0) {
-                    HANDLE thread = CreateThread(NULL, 0, CaptureSwitchThread, NULL, 0, NULL);
-                    if (thread) {
-                        CloseHandle(thread);
-                    } else {
-                        InterlockedExchange(&g_switch_pending, 0);
-                    }
-                }
-                break;
+    if (result == 0 && !tap_ctx) {
+        InterlockedExchangePointer((PVOID volatile*)&g_normal_queue, queue);
+    }
+    if (result == 0 && tap_ctx) {
+        InterlockedExchangePointer((PVOID volatile*)&g_normal_queue, NULL);
+        InterlockedExchange(&tap_ctx->started, 1);
+        LOGI("AudioQueueStart: qlac tap queue=%p prepared=%d", queue, prepared ? 1 : 0);
+        if (!prepared && InterlockedCompareExchange(&g_switch_pending, 1, 0) == 0) {
+            HANDLE thread = CreateThread(NULL, 0, CaptureSwitchThread, NULL, 0, NULL);
+            if (thread) {
+                CloseHandle(thread);
+            } else {
+                InterlockedExchange(&g_switch_pending, 0);
             }
         }
     }

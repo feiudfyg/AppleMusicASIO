@@ -15,9 +15,12 @@ typedef struct WasapiSink {
     IAudioClient* client;
     RealClientFns fns;
     IAudioRenderClient* render;
+    IAudioClock* clock;
+    UINT64 clock_frequency;
     HANDLE event;
     HANDLE thread;
     volatile LONG stop;
+    volatile LONG dead;
     BOOL own_client;
     BOOL event_mode;
     BOOL started;
@@ -54,9 +57,15 @@ BOOL Wasapi_PickExclusive(IAudioClient* client, const RealClientFns* fns,
     int count = 0;
     cands[count++] = *mix;
     Format_Make(&cands[count++], mix->rate, mix->channels, AMB_SAMPLE_F32, 32);
-    Format_Make(&cands[count++], mix->rate, mix->channels, AMB_SAMPLE_S32, 32);
-    Format_Make(&cands[count++], mix->rate, mix->channels, AMB_SAMPLE_S32, 24);
-    Format_Make(&cands[count++], mix->rate, mix->channels, AMB_SAMPLE_S24, 24);
+    if (mix->rate == 44100) {
+        /* The MiniFuse accepts 24-in-32 at 44.1 kHz but its packed
+           24-bit format is the stable one at that rate. */
+        Format_Make(&cands[count++], mix->rate, mix->channels, AMB_SAMPLE_S24, 24);
+        Format_Make(&cands[count++], mix->rate, mix->channels, AMB_SAMPLE_S32, 24);
+    } else {
+        Format_Make(&cands[count++], mix->rate, mix->channels, AMB_SAMPLE_S32, 32);
+        Format_Make(&cands[count++], mix->rate, mix->channels, AMB_SAMPLE_S32, 24);
+    }
     Format_Make(&cands[count++], mix->rate, mix->channels, AMB_SAMPLE_S16, 16);
 
     for (int i = 0; i < count; ++i) {
@@ -197,6 +206,19 @@ static void ConvertFrames(WasapiSink* sink, const BYTE* src, BYTE* dst, UINT32 f
     }
 }
 
+static LONG64 WasapiSink_GetPlayed(AmbSink* base)
+{
+    WasapiSink* sink = (WasapiSink*)base;
+    if (sink->clock && sink->clock_frequency) {
+        UINT64 position = 0;
+        if (SUCCEEDED(sink->clock->lpVtbl->GetPosition(sink->clock, &position, NULL))) {
+            return (LONG64)((double)position * (double)sink->fmt.rate /
+                            (double)sink->clock_frequency);
+        }
+    }
+    return sink->stream ? InterlockedCompareExchange64(&sink->stream->frames_played, 0, 0) : 0;
+}
+
 static DWORD WINAPI WasapiFeeder(void* param)
 {
     WasapiSink* sink = (WasapiSink*)param;
@@ -210,13 +232,11 @@ static DWORD WINAPI WasapiFeeder(void* param)
         }
         if (sink->stop) break;
 
-        UINT32 avail = sink->frames;
-        if (!sink->event_mode) {
-            UINT32 padding = 0;
-            if (FAILED(sink->fns.GetCurrentPadding(sink->client, &padding))) continue;
-            if (padding >= sink->frames) continue;
-            avail = sink->frames - padding;
-        }
+        UINT32 padding = 0;
+        if (FAILED(sink->fns.GetCurrentPadding(sink->client, &padding))) continue;
+        if (padding >= sink->frames) continue;
+        UINT32 avail = sink->frames - padding;
+        if (!avail) continue;
         BYTE* data = NULL;
         if (FAILED(sink->render->lpVtbl->GetBuffer(sink->render, avail, &data)) || !data) {
             continue;
@@ -245,8 +265,13 @@ static DWORD WINAPI WasapiFeeder(void* param)
         }
         sink->render->lpVtbl->ReleaseBuffer(sink->render, avail, 0);
 
-        if (got) InterlockedExchangeAdd64(&s->frames_played, (LONG64)got);
+        /* Advance the endpoint clock by the hardware buffer size, not by
+           frames actually present.  On an underrun the ASIO path still
+           advances its clock; doing otherwise here slows the fake app clock
+           and makes the qlac source crawl (pitch down / stutter). */
+        if (avail) InterlockedExchangeAdd64(&s->frames_played, (LONG64)avail);
         if (s->app_event) SetEvent(s->app_event);
+        if (s->pace_event) SetEvent(s->pace_event);
     }
     return 0;
 }
@@ -275,8 +300,15 @@ static HRESULT WasapiSink_CreateClient(IAudioClient** out)
     HRESULT hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_INPROC_SERVER,
                                   &IID_IMMDeviceEnumerator, (void**)&en);
     if (FAILED(hr)) return hr;
-    hr = en->lpVtbl->GetDefaultAudioEndpoint(en, eRender, eConsole, &dev);
-    if (SUCCEEDED(hr)) {
+    if (g_cfg.wasapi_device[0]) {
+        LOGI("WASAPI: opening selected endpoint %ls", g_cfg.wasapi_device);
+        hr = en->lpVtbl->GetDevice(en, g_cfg.wasapi_device, &dev);
+        if (FAILED(hr)) LOGE("WASAPI: selected endpoint unavailable (hr=0x%08lx)",
+                             (unsigned long)hr);
+    } else {
+        hr = en->lpVtbl->GetDefaultAudioEndpoint(en, eRender, eConsole, &dev);
+    }
+    if (SUCCEEDED(hr) && dev) {
         hr = Hooks_ActivateDevice(dev, &IID_IAudioClient, CLSCTX_INPROC_SERVER, NULL,
                                   (void**)out);
     }
@@ -421,6 +453,15 @@ static HRESULT WasapiSink_Open(AmbSink* base, Stream* stream, const AmbAudioForm
         return E_FAIL;
     }
 
+    hr = sink->fns.GetService(sink->client, &IID_IAudioClock, (void**)&sink->clock);
+    if (SUCCEEDED(hr) && sink->clock) {
+        sink->clock->lpVtbl->GetFrequency(sink->clock, &sink->clock_frequency);
+        LOGI("WASAPI clock: frequency=%llu", (unsigned long long)sink->clock_frequency);
+    } else {
+        sink->clock = NULL;
+        LOGW("WASAPI: IAudioClock unavailable");
+    }
+
     sink->frames = frames;
     base->period_frames = frames;
     base->bitperfect = !sink->converting;
@@ -451,7 +492,7 @@ static HRESULT WasapiSink_Start(AmbSink* base)
 {
     WasapiSink* sink = (WasapiSink*)base;
     if (sink->started) return S_OK;
-    if (!sink->client) return E_FAIL;
+    if (!sink->client || sink->dead) return E_FAIL;
 
     HRESULT hr = sink->fns.Start(sink->client);
     if (FAILED(hr)) {
@@ -466,6 +507,10 @@ static HRESULT WasapiSink_Start(AmbSink* base)
         return E_FAIL;
     }
     sink->started = TRUE;
+    if (sink->dead) {
+        WasapiSink_Stop(base);
+        return E_FAIL;
+    }
     if (sink->stream->app_event) SetEvent(sink->stream->app_event);
     LOGI("WASAPI: streaming (exclusive)");
     return S_OK;
@@ -489,18 +534,24 @@ static void WasapiSink_Stop(AmbSink* base)
         LOGW("WASAPI: stream stopped, %ld underruns", sink->underruns);
     }
     if (sink->stream->app_event) SetEvent(sink->stream->app_event);
+    if (sink->stream->pace_event) SetEvent(sink->stream->pace_event);
 }
 
 static void WasapiSink_Close(AmbSink* base)
 {
     WasapiSink* sink = (WasapiSink*)base;
 
+    InterlockedExchange(&sink->dead, 1);
     AcquireSRWLockExclusive(&g_wasapi_lock);
     if (g_wasapi_active == sink) g_wasapi_active = NULL;
     ReleaseSRWLockExclusive(&g_wasapi_lock);
 
     WasapiSink_Stop(base);
 
+    if (sink->clock) {
+        sink->clock->lpVtbl->Release(sink->clock);
+        sink->clock = NULL;
+    }
     if (sink->render) {
         sink->render->lpVtbl->Release(sink->render);
         sink->render = NULL;
@@ -530,6 +581,7 @@ BOOL Sink_WasapiCreate(Stream* stream, const AmbAudioFormat* fmt,
     sink->base.Start = WasapiSink_Start;
     sink->base.Stop = WasapiSink_Stop;
     sink->base.Close = WasapiSink_Close;
+    sink->base.GetPlayed = WasapiSink_GetPlayed;
     sink->fns = *real_fns;
 
     HRESULT hr = sink->base.Open(&sink->base, stream, fmt);

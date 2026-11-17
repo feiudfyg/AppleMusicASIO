@@ -219,7 +219,26 @@ void Hooks_StopCapture(void)
     ReleaseSRWLockExclusive(&g_capture_stream_lock);
     if (!s) return;
     LOGI("capture stop requested: stream=%p", (void*)s);
-    Stream_EndFake(s);
+    Stream_SuspendCapture(s);
+    AsioHost_SilenceOutputs();
+    Stream_ScheduleClose(s, 5000);
+    Stream_Release(s);
+}
+
+static Stream* GetActiveStream(void);
+
+void Hooks_StopNormalStream(void)
+{
+    Stream* s = GetActiveStream();
+    if (!s) return;
+    EnterCriticalSection(&s->lock);
+    BOOL capture = s->capture;
+    LeaveCriticalSection(&s->lock);
+    if (!capture) {
+        LOGI("normal stream stop requested: stream=%p", (void*)s);
+        Stream_SuspendFake(s);
+        AsioHost_SilenceOutputs();
+    }
     Stream_Release(s);
 }
 
@@ -256,45 +275,62 @@ static void ClearActiveStream(Stream* s)
     if (old) Stream_Release(old);
 }
 
-void Hooks_SwitchToCapture(void)
+BOOL Hooks_SwitchToCapture(void)
 {
     Stream* s = GetActiveStream();
-    if (!s) return;
+    if (!s) return FALSE;
 
     AmbAudioFormat app_fmt;
     EnterCriticalSection(&s->lock);
     BOOL already = s->capture;
+    BOOL suspended = s->suspended;
     app_fmt = s->app_fmt;
     LeaveCriticalSection(&s->lock);
-    if (already) {
-        Stream_Release(s);
-        return;
-    }
 
     WAVEFORMATEXTENSIBLE wfx;
     AmbAudioFormat capture_fmt;
     if (!AppHooks_GetCaptureFormat(&wfx.Format, sizeof(wfx)) ||
         !Format_Parse(&capture_fmt, &wfx.Format)) {
         Stream_Release(s);
-        return;
+        return FALSE;
     }
 
     uint32_t capture_rate = AppHooks_GetSourceRate();
     if (!capture_rate) capture_rate = (uint32_t)(capture_fmt.rate + 0.5);
     if (!capture_rate) {
         Stream_Release(s);
-        return;
+        return FALSE;
     }
     Format_Make(&capture_fmt, capture_rate, 2, AMB_SAMPLE_F32, 32);
+
+    if (already && !suspended) {
+        SetCaptureStream(s);
+        BOOL ready = s->sink != NULL;
+        Stream_Release(s);
+        return ready;
+    }
+
+    if (already && Stream_ResumeCapture(s, &app_fmt, &capture_fmt)) {
+        LOGI("bridge: resumed qlac capture at %lu Hz", (unsigned long)capture_rate);
+        SetCaptureStream(s);
+        BOOL ready = s->sink != NULL;
+        Stream_Release(s);
+        return ready;
+    }
+
     LOGI("bridge: switching active stream to qlac source capture %lu Hz", (unsigned long)capture_rate);
     Stream_EndFake(s);
+    BOOL ok = FALSE;
     if (Stream_BeginCapture(s, &app_fmt, &capture_fmt)) {
         SetCaptureStream(s);
         if (!Stream_EnsureCaptureSink(s)) {
             LOGW("bridge: qlac capture ASIO pre-open failed");
+        } else {
+            ok = s->sink != NULL;
         }
     }
     Stream_Release(s);
+    return ok;
 }
 
 static void SetClientEndpoint(IAudioClient* client, BOOL is_default)
@@ -526,6 +562,39 @@ static HRESULT BeginBridge(Stream* s, VtblCtx* c, const WAVEFORMATEX* pFormat)
     BOOL qaac_prelude = source_codec == 0x71616163u;
     if (mode == AMB_MODE_ASIO && g_cfg.follow_source_rate && qaac_prelude) {
         LOGI("bridge: qaac prelude; using normal ASIO/resampling until qlac");
+    } else if (mode == AMB_MODE_EXCLUSIVE && g_cfg.follow_source_rate &&
+               source_codec == 0x716c6163u) {
+        /* qlac is already decoded at its native rate.  Do not first open
+           the app's 96 kHz virtual endpoint and then switch to a 44.1 kHz
+           capture endpoint: that creates two clocks.  Open the capture
+           endpoint directly at the source rate, and make the virtual
+           endpoint use the same rate. */
+        WAVEFORMATEXTENSIBLE capture_wfx;
+        AmbAudioFormat capture_fmt;
+        BOOL have_capture = AppHooks_GetCaptureFormat(&capture_wfx.Format,
+                                                      sizeof(capture_wfx)) &&
+                            Format_Parse(&capture_fmt, &capture_wfx.Format);
+        uint32_t source_rate = AppHooks_GetSourceRate();
+        if (have_capture && source_rate) {
+            AmbAudioFormat app_capture = fmt;
+            Format_Make(&capture_fmt, source_rate, 2, AMB_SAMPLE_F32, 32);
+            EnterCriticalSection(&s->lock);
+            s->mode = mode;
+            s->real_fns = fns;
+            s->has_real_fns = TRUE;
+            LeaveCriticalSection(&s->lock);
+            if (Stream_BeginCapture(s, &app_capture, &capture_fmt)) {
+                SetCaptureStream(s);
+                if (!Stream_EnsureCaptureSink(s)) {
+                    LOGW("bridge: WASAPI capture pre-open failed");
+                }
+                SetActiveStream(s);
+                LOGI("bridge: WASAPI capture stream active at %.0f Hz (one clock)",
+                     (double)source_rate);
+                return S_OK;
+            }
+            LOGW("bridge: WASAPI capture setup failed");
+        }
     } else if (mode == AMB_MODE_ASIO && g_cfg.follow_source_rate) {
         WAVEFORMATEXTENSIBLE capture_wfx;
         AmbAudioFormat capture_fmt;
@@ -839,7 +908,9 @@ static HRESULT STDMETHODCALLTYPE Hook_Start(IAudioClient* This)
         if (s->started) return S_OK;
         if (s->capture) {
             s->app_submitted = 0;
-            QueryPerformanceCounter(&s->app_clock_start);
+            /* Anchor the virtual clock on the first render, not on Start:
+               Start can precede the first submitted buffer by seconds. */
+            s->app_clock_start.QuadPart = 0;
             s->started = TRUE;
             Stream_Signal(s);
             if (s->pace_event) SetEvent(s->pace_event);

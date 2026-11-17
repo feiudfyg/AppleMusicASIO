@@ -8,9 +8,6 @@
 static SRWLOCK g_streams_lock = SRWLOCK_INIT;
 static Stream* g_streams[AMB_MAX_STREAMS];
 
-static HANDLE g_capture_dump = INVALID_HANDLE_VALUE;
-static LONG64 g_capture_dump_frames = 0;
-#define CAPTURE_DUMP_LIMIT (44100LL * 10)
 #define AMB_CAPTURE_SILENCE 0
 #define AMB_CAPTURE_THROTTLE 0
 #define AMB_APP_BUFFER_FRAMES 4096
@@ -124,6 +121,14 @@ static HRESULT STDMETHODCALLTYPE Render_ReleaseBuffer(IAudioRenderClient* This,
     if (n > s->ring.cap_frames) n = s->ring.cap_frames;
 
     if (s->capture) {
+        /* The virtual endpoint clock starts at the first app render after
+           the capture switch, not when the physical sink happens to open.
+           Otherwise QPC can report a large positive position before Apple
+           has submitted anything, and the app renders without pacing. */
+        if (n && s->app_clock_start.QuadPart == 0) {
+            QueryPerformanceCounter(&s->app_clock_start);
+            s->started = TRUE;
+        }
         InterlockedExchangeAdd64(&s->app_submitted, (LONG64)n);
         self->requested = 0;
         LeaveCriticalSection(&s->lock);
@@ -699,7 +704,7 @@ void Stream_Release(Stream* s)
 static void Stream_CloseSinkLocked(Stream* s)
 {
     if (s->sink) {
-        if (s->sink_started) s->sink->Stop(s->sink);
+        s->suspended = TRUE;
         s->sink->Close(s->sink);
         free(s->sink);
         s->sink = NULL;
@@ -710,6 +715,7 @@ static void Stream_CloseSinkLocked(Stream* s)
     s->initialized = FALSE;
     s->started = FALSE;
     s->sink_started = FALSE;
+    s->suspended = FALSE;
     s->app_period_frames = 0;
     s->app_submitted = 0;
     s->app_clock_start.QuadPart = 0;
@@ -721,6 +727,12 @@ void Stream_EndFake(Stream* s)
     EnterCriticalSection(&s->lock);
     LOGI("stream end: %p capture=%d started=%d sink=%p",
          (void*)s, s->capture ? 1 : 0, s->started ? 1 : 0, (void*)s->sink);
+    /* Stop must be preceded by a gate and a clear.  sink->Stop can take
+       several hundred milliseconds, and the ASIO callback must already be
+       emitting silence before the driver is torn down. */
+    s->suspended = TRUE;
+    s->started = FALSE;
+    Ring_Clear(&s->ring);
     Stream_CloseSinkLocked(s);
     LeaveCriticalSection(&s->lock);
     AsioHost_CloseIfIdle();
@@ -747,7 +759,9 @@ void Stream_Signal(Stream* s)
 LONG64 Stream_GetAppFramesPlayed(Stream* s)
 {
     if (!s) return 0;
-    LONG64 played = InterlockedCompareExchange64(&s->frames_played, 0, 0);
+    LONG64 played = s->sink && s->sink->GetPlayed
+                        ? s->sink->GetPlayed(s->sink)
+                        : InterlockedCompareExchange64(&s->frames_played, 0, 0);
     if (!s->capture) return played;
 
     double app_rate = s->app_fmt.rate;
@@ -756,8 +770,8 @@ LONG64 Stream_GetAppFramesPlayed(Stream* s)
         played = (LONG64)((double)played * app_rate / capture_rate);
     }
 
-    if (!s->sink_started && s->started && s->app_clock_start.QuadPart != 0 &&
-        app_rate > 0.0) {
+    if (!s->sink && s->app_clock_start.QuadPart != 0 && app_rate > 0.0 &&
+        (s->started || s->sink_started)) {
         LARGE_INTEGER now;
         LARGE_INTEGER freq;
         QueryPerformanceCounter(&now);
@@ -792,6 +806,12 @@ BOOL Stream_BeginFake(Stream* s, const AmbAudioFormat* fmt, int mode,
     s->mode = mode;
     s->capture = FALSE;
     s->bitperfect = FALSE;
+    if (real_fns) {
+        s->real_fns = *real_fns;
+        s->has_real_fns = TRUE;
+    } else {
+        s->has_real_fns = FALSE;
+    }
     s->frames_played = 0;
     s->app_submitted = 0;
     s->app_clock_start.QuadPart = 0;
@@ -852,20 +872,9 @@ BOOL Stream_BeginCapture(Stream* s, const AmbAudioFormat* app_fmt,
 {
     if (!s || !app_fmt || !capture_fmt) return FALSE;
 
-    if (g_capture_dump == INVALID_HANDLE_VALUE && g_capture_dump_frames == 0) {
-        wchar_t dump_path[MAX_PATH] = {0};
-        DWORD temp_len = GetTempPathW(MAX_PATH, dump_path);
-        if (temp_len > 0 && temp_len < MAX_PATH) {
-            wcscat_s(dump_path, MAX_PATH, L"AppleMusicASIO-capture.f32");
-            g_capture_dump = CreateFileW(dump_path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
-                                         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-            if (g_capture_dump != INVALID_HANDLE_VALUE) {
-                LOGI("capture dump: %ls", dump_path);
-            }
-        }
-    }
-
     EnterCriticalSection(&s->lock);
+    int capture_mode = s->mode;
+    InterlockedIncrement(&s->capture_epoch);
     Stream_CloseSinkLocked(s);
     Ring_Free(&s->ring);
     free(s->staging);
@@ -873,7 +882,7 @@ BOOL Stream_BeginCapture(Stream* s, const AmbAudioFormat* app_fmt,
 
     s->app_fmt = *app_fmt;
     s->capture_fmt = *capture_fmt;
-    s->mode = AMB_MODE_ASIO;
+    s->mode = capture_mode;
     s->capture = TRUE;
     s->bitperfect = FALSE;
     s->frames_played = 0;
@@ -906,6 +915,7 @@ BOOL Stream_BeginCapture(Stream* s, const AmbAudioFormat* app_fmt,
     s->initialized = TRUE;
     s->started = FALSE;
     s->sink_started = FALSE;
+    s->suspended = FALSE;
     s->bitperfect = FALSE;
 
     LOGI("capture stream pending: app %.0f Hz / capture %.0f Hz, %lu frames",
@@ -915,30 +925,147 @@ BOOL Stream_BeginCapture(Stream* s, const AmbAudioFormat* app_fmt,
     return TRUE;
 }
 
-BOOL Stream_EnsureCaptureSink(Stream* s)
+BOOL Stream_ResumeCapture(Stream* s, const AmbAudioFormat* app_fmt,
+                          const AmbAudioFormat* capture_fmt)
+{
+    if (!s || !app_fmt || !capture_fmt) return FALSE;
+
+    EnterCriticalSection(&s->lock);
+    if (!s->capture || !s->sink || !s->ring.data || !s->staging ||
+        !Format_Equal(&s->capture_fmt, capture_fmt)) {
+        LeaveCriticalSection(&s->lock);
+        return FALSE;
+    }
+
+    InterlockedIncrement(&s->capture_epoch);
+    Ring_Clear(&s->ring);
+    s->app_fmt = *app_fmt;
+    s->capture_fmt = *capture_fmt;
+    s->app_submitted = 0;
+    s->app_clock_start.QuadPart = 0;
+    s->frames_played = 0;
+    s->capture_frames = 0;
+    s->started = FALSE;
+    s->suspended = FALSE;
+    s->bitperfect = s->sink->bitperfect;
+    LOGI("capture resumed: stream=%p capture=%.0f Hz sink_started=%d",
+         (void*)s, (double)capture_fmt->rate, s->sink_started ? 1 : 0);
+    LeaveCriticalSection(&s->lock);
+    if (s->pace_event) SetEvent(s->pace_event);
+    return TRUE;
+}
+
+void Stream_SuspendFake(Stream* s)
+{
+    if (!s) return;
+    EnterCriticalSection(&s->lock);
+    if (s->fake) {
+        s->started = FALSE;
+        s->suspended = TRUE;
+        s->app_submitted = 0;
+        s->app_clock_start.QuadPart = 0;
+        s->frames_played = 0;
+        Ring_Clear(&s->ring);
+        LOGI("normal stream suspended: stream=%p sink=%p", (void*)s, (void*)s->sink);
+    }
+    LeaveCriticalSection(&s->lock);
+    if (s->pace_event) SetEvent(s->pace_event);
+}
+
+void Stream_SuspendCapture(Stream* s)
+{
+    if (!s) return;
+    EnterCriticalSection(&s->lock);
+    if (s->capture) {
+        s->started = FALSE;
+        s->suspended = TRUE;
+        s->app_submitted = 0;
+        s->app_clock_start.QuadPart = 0;
+        s->frames_played = 0;
+        s->capture_frames = 0;
+        Ring_Clear(&s->ring);
+        LOGI("capture suspended: stream=%p sink=%p", (void*)s, (void*)s->sink);
+    }
+    LeaveCriticalSection(&s->lock);
+    if (s->pace_event) SetEvent(s->pace_event);
+}
+
+typedef struct CloseCaptureCtx {
+    Stream* stream;
+    LONG epoch;
+    DWORD delay_ms;
+} CloseCaptureCtx;
+
+static DWORD WINAPI CloseCaptureThread(void* parameter)
+{
+    CloseCaptureCtx* ctx = (CloseCaptureCtx*)parameter;
+    Sleep(ctx->delay_ms);
+    Stream* s = ctx->stream;
+    if (s && s->capture_epoch == ctx->epoch && s->capture && !s->started) {
+        Stream_EndFake(s);
+    }
+    if (s) Stream_Release(s);
+    free(ctx);
+    return 0;
+}
+
+void Stream_ScheduleClose(Stream* s, DWORD delay_ms)
+{
+    if (!s) return;
+    CloseCaptureCtx* ctx = (CloseCaptureCtx*)calloc(1, sizeof(*ctx));
+    if (!ctx) return;
+    ctx->stream = s;
+    ctx->epoch = InterlockedIncrement(&s->capture_epoch);
+    ctx->delay_ms = delay_ms ? delay_ms : 1000;
+    Stream_AddRef(s);
+    HANDLE thread = CreateThread(NULL, 0, CloseCaptureThread, ctx, 0, NULL);
+    if (thread) {
+        CloseHandle(thread);
+    } else {
+        Stream_Release(s);
+        free(ctx);
+    }
+}
+
+static SRWLOCK g_capture_sink_lock = SRWLOCK_INIT;
+
+static BOOL EnsureCaptureSinkImpl(Stream* s)
 {
     if (!s) return FALSE;
 
     AmbAudioFormat fmt;
+    int mode;
+    BOOL have_real_fns;
+    RealClientFns real_fns;
     EnterCriticalSection(&s->lock);
     if (!s->capture || s->sink) {
         LeaveCriticalSection(&s->lock);
         return s->capture != FALSE;
     }
     fmt = s->capture_fmt;
+    mode = s->mode;
+    have_real_fns = s->has_real_fns;
+    real_fns = s->real_fns;
     LeaveCriticalSection(&s->lock);
 
     AmbSink* sink = NULL;
-    if (!Sink_AsioCreate(s, &fmt, &sink) || !sink) {
+    BOOL ok;
+    if (mode == AMB_MODE_EXCLUSIVE && have_real_fns) {
+        ok = Sink_WasapiCreate(s, &fmt, &real_fns, &sink);
+    } else {
+        ok = Sink_AsioCreate(s, &fmt, &sink);
+    }
+    if (!ok || !sink) {
         return FALSE;
     }
 
     EnterCriticalSection(&s->lock);
-    if (!s->capture) {
+    if (!s->capture || s->sink) {
+        BOOL ready = s->capture && s->sink != NULL;
         LeaveCriticalSection(&s->lock);
         sink->Close(sink);
         free(sink);
-        return FALSE;
+        return ready;
     }
 
     sink->SetRing(sink, &s->ring);
@@ -947,40 +1074,19 @@ BOOL Stream_EnsureCaptureSink(Stream* s)
     s->bitperfect = sink->bitperfect;
 
     LeaveCriticalSection(&s->lock);
-    UINT32 fill = 0;
-    for (int i = 0; i < 200; ++i) {
-        EnterCriticalSection(&s->lock);
-        BOOL active = s->capture && s->sink == sink;
-        fill = Ring_Fill(&s->ring);
-        LeaveCriticalSection(&s->lock);
-        if (!active || fill >= 1024) break;
-        Sleep(5);
-    }
-    EnterCriticalSection(&s->lock);
-    if (!s->capture || s->sink != sink) {
-        LeaveCriticalSection(&s->lock);
-        sink->Close(sink);
-        free(sink);
-        return FALSE;
-    }
-    if (fill < 1024) {
-        LOGI("capture: deferred start, prefill %lu frames", (unsigned long)fill);
-        LeaveCriticalSection(&s->lock);
-        return TRUE;
-    }
-    LOGI("capture: prefill %lu frames", (unsigned long)fill);
-    HRESULT hr = sink->Start(sink);
-    if (FAILED(hr)) {
-        LOGW("capture: ASIO start failed 0x%08lx", (unsigned long)hr);
-    } else {
-        s->sink_started = TRUE;
-    }
-
-    LOGI("capture stream started: capture %.0f Hz, period %lu frames, %s",
-         (double)s->capture_fmt.rate, (unsigned long)s->app_period_frames,
+    LOGI("capture sink ready: capture %.0f Hz, app period %lu frames, %s; waiting for tap prefill",
+         (double)fmt.rate, (unsigned long)AMB_APP_BUFFER_FRAMES,
          s->bitperfect ? "bit-perfect" : "transparent conversion");
-    LeaveCriticalSection(&s->lock);
     return TRUE;
+}
+
+BOOL Stream_EnsureCaptureSink(Stream* s)
+{
+    if (!s) return FALSE;
+    AcquireSRWLockExclusive(&g_capture_sink_lock);
+    BOOL ok = EnsureCaptureSinkImpl(s);
+    ReleaseSRWLockExclusive(&g_capture_sink_lock);
+    return ok;
 }
 
 static DWORD WINAPI CaptureSinkThread(void* parameter)
@@ -1013,11 +1119,11 @@ static void RequestCaptureSink(Stream* s)
 BOOL Stream_WriteCapture(Stream* s, const void* data, uint32_t frames)
 {
     if (!s || !data || !frames) return FALSE;
-    if (s->capture && !s->sink) {
+    if (s->capture && !s->suspended && !s->sink) {
         RequestCaptureSink(s);
     }
     EnterCriticalSection(&s->lock);
-    if (!s->capture || !s->ring.data) {
+    if (!s->capture || s->suspended || !s->ring.data) {
         LeaveCriticalSection(&s->lock);
         return FALSE;
     }
@@ -1073,10 +1179,11 @@ BOOL Stream_WriteCapture(Stream* s, const void* data, uint32_t frames)
              (unsigned long)Ring_Fill(&s->ring));
     }
     AmbSink* start_sink = NULL;
-    if (s->sink && !s->sink_started && Ring_Fill(&s->ring) >= 1024) {
+    uint32_t prefill = 1024;
+    if (s->sink && !s->sink_started && Ring_Fill(&s->ring) >= prefill) {
         s->sink_started = TRUE;
         start_sink = s->sink;
-        LOGI("capture: starting ASIO after prefill %lu frames",
+        LOGI("capture: starting sink after prefill %lu frames",
              (unsigned long)Ring_Fill(&s->ring));
     }
     LeaveCriticalSection(&s->lock);
@@ -1088,20 +1195,6 @@ BOOL Stream_WriteCapture(Stream* s, const void* data, uint32_t frames)
             EnterCriticalSection(&s->lock);
             if (s->sink == start_sink) s->sink_started = FALSE;
             LeaveCriticalSection(&s->lock);
-        }
-    }
-
-    if (g_capture_dump != INVALID_HANDLE_VALUE &&
-        g_capture_dump_frames < CAPTURE_DUMP_LIMIT) {
-        DWORD bytes = frames * s->capture_fmt.frame_bytes;
-        DWORD wrote = 0;
-        if (WriteFile(g_capture_dump, data, bytes, &wrote, NULL)) {
-            g_capture_dump_frames += frames;
-        }
-        if (g_capture_dump_frames >= CAPTURE_DUMP_LIMIT) {
-            CloseHandle(g_capture_dump);
-            g_capture_dump = INVALID_HANDLE_VALUE;
-            LOGI("capture dump complete: %lld frames", (long long)g_capture_dump_frames);
         }
     }
 

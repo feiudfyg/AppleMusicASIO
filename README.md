@@ -23,7 +23,8 @@ render stream remain in the path. DRM is not bypassed.
 - The bridge is installed in protected `%ProgramFiles%\AppleMusicASIO`; its
   SHA-256 is compiled into the shim and checked before loading.
 - Static C runtime and no Visual C++ redistributable.
-- Simple installer with an ASIO / WASAPI-exclusive mode selector.
+- Setup lists every render device that supports ASIO or WASAPI exclusive,
+  labels the supported backend, and remembers the selected device.
 
 Tested with Windows 11 x64, Apple Music `1.1540.23042.0`, a MiniFuse ASIO driver
 and both output modes. Other drivers and Apple Music versions are untested.
@@ -34,26 +35,34 @@ The installer is machine-wide and requires administrator approval.
 
 1. Close Apple Music.
 2. Run `AMAudioBridgeSetup.exe` from the release folder. Approve the UAC prompt.
-3. Select `WASAPI exclusive` or `ASIO`, click `Install`, then start Apple Music.
+3. Select an output device from the list, click `Install`, then start Apple Music.
 
 The installer:
 
-- Copies `AMVerifierShim.dll`, `AMAudioBridge.dll`, `AMPrefsPersist.dll` and
-  `AMAudioBridge.ini` to `%ProgramFiles%\AppleMusicASIO`.
+- Probes active render endpoints for WASAPI exclusive support and registered
+  ASIO drivers for ASIO support. The list contains only supported combinations;
+  devices with both backends appear as separate ASIO and WASAPI entries.
+- Copies `AMVerifierShim.dll`, `AMAudioBridge.dll`, `AMPrefsPersist.dll`,
+  `AMAudioBridge.ini` and the setup program itself to
+  `%ProgramFiles%\AppleMusicASIO`.
+- Creates `Apple Music ASIO.lnk` on the public desktop, pointing at the copied
+  setup program, so the same program handles later settings, repair and
+  uninstall.
 - Creates a hard link to the shim in `System32` and configures the Application
   Verifier IFEO entry for `AMPLibraryAgent.exe` only.
 - Protects the Program Files directory with an administrator-only write ACL.
 - Removes old `AppleMusic.exe` verifier, per-user early proxy and
   `MMDeviceEnumerator` COM registrations during migration.
-- Stores the selected mode in
-  `HKCU\Software\AppleMusicASIO\Mode`.
+- Stores the selected backend in `HKCU\Software\AppleMusicASIO\Mode` and the
+  selected device in `HKCU\Software\AppleMusicASIO\Device`.
 
-`Apply` saves a mode change and closes the window. `Close` discards the change.
-Restart Apple Music after changing the mode.
+`Apply` saves an output-device change and closes the window. `Close` discards
+the change. Restart Apple Music after changing the device.
 
-To uninstall, close Apple Music, run `AMAudioBridgeSetup.exe` and click
-`Uninstall`. The preferences junction, if created, is kept because it also fixes
-Apple Music's settings persistence.
+To uninstall, close Apple Music, run `AMAudioBridgeSetup.exe` (normally from the
+public desktop shortcut) and click `Uninstall`. The preferences junction, if
+created, is kept because it also fixes Apple Music's settings persistence. The
+setup program remains in `%ProgramFiles%\AppleMusicASIO` for repair or reinstall.
 
 ## Security model
 
@@ -98,15 +107,18 @@ Apple Music builds by faking the device format rate.
 
 ## Configuration
 
-The setup program stores the output mode here:
+The setup program stores the selected backend and device here:
 
 ```text
 HKCU\Software\AppleMusicASIO\Mode
+HKCU\Software\AppleMusicASIO\Device
 ```
 
-Values: `wasapi`, `asio`, `auto`, `monitor`, `off`. The registry value overrides
-`Mode` in `AMAudioBridge.ini`. Other settings are read from the INI in
-`%ProgramFiles%\AppleMusicASIO`:
+`Mode` is `wasapi` or `asio` for a selected output device (and also accepts
+`auto`, `monitor`, `off` for manual troubleshooting). `Device` is
+`wasapi:<endpoint-id>` or `asio:<registered-driver-key>`. These values override
+`Mode` and `[ASIO] Driver` in `AMAudioBridge.ini`. Other settings are read from
+the INI in `%ProgramFiles%\AppleMusicASIO`:
 
 ```ini
 [Bridge]
@@ -154,8 +166,8 @@ Program Files directory is not writable.
 From a Visual Studio x64 developer environment:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\build.ps1 -OutputDir bin\x64\Release\v062
-powershell -ExecutionPolicy Bypass -File .\release.ps1 -BuildDir bin\x64\Release\v062 -Version 0.6.2
+powershell -ExecutionPolicy Bypass -File .\build.ps1 -OutputDir bin\x64\Release\v070
+powershell -ExecutionPolicy Bypass -File .\release.ps1 -BuildDir bin\x64\Release\v070 -Version 0.7.0
 ```
 
 The release contains `AMAudioBridgeSetup.exe`, `AMAudioBridge.dll`,

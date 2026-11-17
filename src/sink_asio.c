@@ -9,6 +9,8 @@ typedef struct AsioSink {
     Stream* stream;
     AmbAudioFormat fmt;
     AsioFormatInfo info;
+    AmbRing* ring;
+    BOOL persistent;
 } AsioSink;
 
 BOOL Asio_MapNativeFormat(long type, UINT32 rate, UINT32 channels, AmbAudioFormat* out)
@@ -64,6 +66,7 @@ static HRESULT AsioSink_Open(AmbSink* base, Stream* stream, const AmbAudioFormat
     AsioSink* sink = (AsioSink*)base;
     sink->stream = stream;
     sink->fmt = *fmt;
+    sink->persistent = TRUE;
 
     HRESULT hr = AsioHost_OpenStream((double)fmt->rate, (int)fmt->channels,
                                      g_cfg.asio_buffer_frames, &sink->info);
@@ -113,6 +116,7 @@ static void AsioSink_SetRing(AmbSink* base, AmbRing* ring)
     AsioSink* sink = (AsioSink*)base;
     Stream* s = sink->stream;
 
+    sink->ring = ring;
     AsioConsumer consumer;
     ZeroMemory(&consumer, sizeof(consumer));
     consumer.ring = ring;
@@ -120,6 +124,7 @@ static void AsioSink_SetRing(AmbSink* base, AmbRing* ring)
     consumer.channels = sink->fmt.channels;
     consumer.event = &s->app_event;
     consumer.pace_event = &s->pace_event;
+    consumer.gate = &s->suspended;
     consumer.frames_played = &s->frames_played;
     consumer.gain = &s->gain;
     consumer.mute = &s->mute;
@@ -135,6 +140,13 @@ static void AsioSink_SetRing(AmbSink* base, AmbRing* ring)
          consumer.volume_enabled ? "app" : "unity");
 }
 
+static LONG64 AsioSink_GetPlayed(AmbSink* base)
+{
+    AsioSink* sink = (AsioSink*)base;
+    if (!sink->stream) return 0;
+    return InterlockedCompareExchange64(&sink->stream->frames_played, 0, 0);
+}
+
 static HRESULT AsioSink_Start(AmbSink* base)
 {
     AMB_UNUSED(base);
@@ -143,7 +155,16 @@ static HRESULT AsioSink_Start(AmbSink* base)
 
 static void AsioSink_Stop(AmbSink* base)
 {
-    AMB_UNUSED(base);
+    AsioSink* sink = (AsioSink*)base;
+    if (sink->persistent) {
+        /* Keep the ASIO driver and its buffers alive for the whole Apple
+           Music session.  Stream switches only swap the consumer, so the
+           driver never goes through a stop/start transient. */
+        AsioHost_SilenceOutputs();
+        LOGI("ASIO: persistent stream kept running");
+        return;
+    }
+
     AsioHost_Stop();
     LONG64 frames = 0;
     LONG underruns = 0;
@@ -159,7 +180,10 @@ static void AsioSink_Stop(AmbSink* base)
 static void AsioSink_Close(AmbSink* base)
 {
     AsioSink* sink = (AsioSink*)base;
-    AMB_UNUSED(sink);
+    if (sink->persistent) {
+        AsioHost_DetachConsumer(sink->ring);
+        return;
+    }
     AsioHost_CloseStream();
     AsioHost_Close();
 }
@@ -176,6 +200,7 @@ BOOL Sink_AsioCreate(Stream* stream, const AmbAudioFormat* fmt, AmbSink** out_si
     sink->base.Start = AsioSink_Start;
     sink->base.Stop = AsioSink_Stop;
     sink->base.Close = AsioSink_Close;
+    sink->base.GetPlayed = AsioSink_GetPlayed;
 
     HRESULT hr = sink->base.Open(&sink->base, stream, fmt);
     if (FAILED(hr)) {

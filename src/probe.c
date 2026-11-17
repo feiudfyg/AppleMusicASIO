@@ -19,6 +19,7 @@ static int Run(int argc, wchar_t** argv)
     int silent = 0;
     int use_exclusive = 0;
     int force_float32 = 0;
+    int force_int32 = 0;
     int no_mix = 0;
     UINT32 force_rate = 0;
     UINT32 force_channels = 2;
@@ -32,10 +33,11 @@ static int Run(int argc, wchar_t** argv)
         else if (!_wcsicmp(argv[i], L"--silent")) silent = 1;
         else if (!_wcsicmp(argv[i], L"--exclusive")) use_exclusive = 1;
         else if (!_wcsicmp(argv[i], L"--float32")) force_float32 = 1;
+        else if (!_wcsicmp(argv[i], L"--int32")) force_int32 = 1;
         else if (!_wcsicmp(argv[i], L"--no-mix")) no_mix = 1;
         else {
             printf("usage: AMAudioProbe [--load dll] [--seconds n] [--amplitude x] [--silent]\n"
-                   "                   [--exclusive] [--float32] [--no-mix] [--rate hz] [--channels n]\n");
+                   "                   [--exclusive] [--float32|--int32] [--no-mix] [--rate hz] [--channels n]\n");
             return 2;
         }
     }
@@ -109,6 +111,11 @@ static int Run(int argc, wchar_t** argv)
                         AMB_SAMPLE_F32, 32);
         }
     }
+    if (force_int32) {
+        Format_Make(&fmt, force_rate ? force_rate : fmt.rate,
+                    force_channels ? force_channels : fmt.channels,
+                    AMB_SAMPLE_S32, 24);
+    }
     PrintFormat("app format", &fmt.wfx.Format);
 
     REFERENCE_TIME def_period = 0, min_period = 0;
@@ -119,8 +126,9 @@ static int Run(int argc, wchar_t** argv)
     HANDLE event = CreateEventW(NULL, FALSE, FALSE, NULL);
     AUDCLNT_SHAREMODE share = use_exclusive ? AUDCLNT_SHAREMODE_EXCLUSIVE
                                             : AUDCLNT_SHAREMODE_SHARED;
+    REFERENCE_TIME request = use_exclusive ? 200000 : 10000000;
     hr = client->lpVtbl->Initialize(client, share, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                                    10000000, 0, &fmt.wfx.Format, NULL);
+                                    request, 0, &fmt.wfx.Format, NULL);
     printf("Initialize(share=%d): 0x%08lx\n", (int)share, (unsigned long)hr);
     if (FAILED(hr)) {
         return 1;
@@ -197,8 +205,16 @@ static int Run(int argc, wchar_t** argv)
             }
             memcpy(data, scratch, (size_t)avail * frame_bytes);
         } else {
-            /* Integer formats are not exercised by this simple probe. */
-            memset(data, 0, (size_t)avail * frame_bytes);
+            int32_t* out = (int32_t*)data;
+            for (UINT32 i = 0; i < avail; ++i) {
+                float v = (float)(sin(phase) * amplitude);
+                phase += step;
+                if (phase > 2.0 * 3.14159265358979323846) phase -= 2.0 * 3.14159265358979323846;
+                int32_t q = (int32_t)llrint((double)v *
+                                            (double)(1 << (fmt.valid_bits - 1)));
+                int32_t x = q << (fmt.bits - fmt.valid_bits);
+                for (UINT32 c = 0; c < channels; ++c) out[i * channels + c] = x;
+            }
         }
 
         hr = render->lpVtbl->ReleaseBuffer(render, avail, 0);

@@ -39,6 +39,8 @@ struct Stream {
     BOOL have_plan;
 
     struct AmbSink* sink;
+    RealClientFns real_fns;
+    BOOL has_real_fns;
     AmbRing ring;
     uint8_t* staging;
     uint32_t app_period_frames;
@@ -51,11 +53,13 @@ struct Stream {
     BOOL initialized;
     BOOL started;
     BOOL sink_started;
+    BOOL suspended;
     BOOL bitperfect;
     int mode;
     AmbAudioFormat capture_fmt;
     volatile LONG64 capture_frames;
     volatile LONG sink_starting;
+    volatile LONG capture_epoch;
 
     volatile LONG64 app_submitted;
     LARGE_INTEGER app_clock_start;
@@ -73,6 +77,11 @@ BOOL Stream_BeginFake(Stream* s, const AmbAudioFormat* fmt, int mode,
                       const RealClientFns* real_fns);
 BOOL Stream_BeginCapture(Stream* s, const AmbAudioFormat* app_fmt,
                          const AmbAudioFormat* capture_fmt);
+BOOL Stream_ResumeCapture(Stream* s, const AmbAudioFormat* app_fmt,
+                          const AmbAudioFormat* capture_fmt);
+void Stream_SuspendCapture(Stream* s);
+void Stream_SuspendFake(Stream* s);
+void Stream_ScheduleClose(Stream* s, DWORD delay_ms);
 BOOL Stream_EnsureCaptureSink(Stream* s);
 BOOL Stream_WriteCapture(Stream* s, const void* data, uint32_t frames);
 void Stream_Signal(Stream* s);

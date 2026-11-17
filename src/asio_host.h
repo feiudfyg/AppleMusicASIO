@@ -23,6 +23,7 @@ typedef struct AsioConsumer {
     UINT32 channels;
     HANDLE* event;
     HANDLE* pace_event;
+    volatile BOOL* gate;
     volatile LONG64* frames_played;
     volatile float* gain;
     volatile BOOL* mute;
@@ -37,9 +38,12 @@ BOOL Asio_Available(const wchar_t* wanted);
 
 HRESULT AsioHost_Probe(double rate, int channels, int buffer_frames, AsioFormatInfo* out);
 HRESULT AsioHost_OpenStream(double rate, int channels, int buffer_frames, AsioFormatInfo* out);
+BOOL AsioHost_Prewarm(double rate, int channels, int buffer_frames);
 void AsioHost_SetConsumer(const AsioConsumer* consumer);
 HRESULT AsioHost_Start(void);
 void AsioHost_Stop(void);
+void AsioHost_SilenceOutputs(void);
+void AsioHost_DetachConsumer(AmbRing* ring);
 void AsioHost_CloseStream(void);
 void AsioHost_Close(void);
 void AsioHost_CloseIfIdle(void);

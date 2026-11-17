@@ -3,6 +3,7 @@
 #include "config.h"
 #include "hooks.h"
 #include "app_hooks.h"
+#include "asio_host.h"
 #include "setup_common.h"
 
 static HMODULE g_module = NULL;
@@ -74,6 +75,23 @@ static DWORD WINAPI BridgeInitThread(void* param)
     }
 
     AppHooks_Start(g_module);
+
+    AmbMode effective = g_cfg.mode;
+    if (effective == AMB_MODE_AUTO) {
+        effective = Asio_Available(g_cfg.asio_driver)
+            ? AMB_MODE_ASIO : AMB_MODE_EXCLUSIVE;
+    }
+    if (effective == AMB_MODE_ASIO) {
+        double prewarm_rate = g_cfg.asio_rate > 0
+            ? (double)g_cfg.asio_rate : 0.0;
+        int prewarm_channels = g_cfg.asio_channels > 0
+            ? g_cfg.asio_channels : 2;
+        LOGI("ASIO: prewarming%s", prewarm_rate > 0.0 ? "" : " at driver rate");
+        if (!AsioHost_Prewarm(prewarm_rate, prewarm_channels,
+                              g_cfg.asio_buffer_frames)) {
+            LOGW("ASIO: prewarm failed; will retry on first playback");
+        }
+    }
 
     LOGI("bridge ready (%u.%u.%u)",
          AMB_VERSION_MAJOR, AMB_VERSION_MINOR, AMB_VERSION_PATCH);

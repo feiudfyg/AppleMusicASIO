@@ -333,6 +333,27 @@ static HRESULT OpenStreamTask(void* param)
     HRESULT hr = EnsureAsioObject();
     if (FAILED(hr)) return hr;
 
+    long want_buffer = a->buffer_frames > 0
+        ? ChooseBufferSize(a->buffer_frames)
+        : g_asio.buffer_frames;
+    if (g_asio.have_buffers &&
+        fabs(g_asio.rate - a->rate) < 0.5 &&
+        a->channels <= g_asio.channels &&
+        (a->buffer_frames <= 0 || want_buffer == g_asio.buffer_frames)) {
+        if (a->out) {
+            a->out->rate = g_asio.rate;
+            a->out->channels = g_asio.channels;
+            a->out->buffer_frames = g_asio.buffer_frames;
+            a->out->sample_type = g_asio.sample_type;
+            char name[64] = {0};
+            IASIO_CALL(g_asio.asio, getDriverName, name);
+            strncpy_s(a->out->driver, sizeof(a->out->driver), name, _TRUNCATE);
+        }
+        LOGI("ASIO: reusing running stream (%ld frames, %ld ch)",
+             g_asio.buffer_frames, g_asio.channels);
+        return S_OK;
+    }
+
     if (g_asio.running) {
         InterlockedExchange(&g_asio.running, 0);
         IASIO_CALLO(g_asio.asio, stop);
@@ -422,6 +443,37 @@ static HRESULT StartTask(void* param)
     return S_OK;
 }
 
+static HRESULT GetRateTask(void* param)
+{
+    double* out = (double*)param;
+    if (!out) return E_POINTER;
+    *out = 0.0;
+    HRESULT hr = EnsureAsioObject();
+    if (FAILED(hr)) return hr;
+    ASIOSampleRate rate = 0;
+    if (IASIO_CALL(g_asio.asio, getSampleRate, &rate) == ASE_OK) {
+        *out = rate;
+    }
+    return *out > 0.0 ? S_OK : E_FAIL;
+}
+
+static HRESULT PrewarmTask(void* param)
+{
+    AMB_UNUSED(param);
+    if (!g_asio.asio || !g_asio.have_buffers) return E_FAIL;
+    if (g_asio.running) return S_OK;
+    g_asio.rate_changed = 0;
+    InterlockedExchange(&g_asio.running, 1);
+    ASIOError e = IASIO_CALLO(g_asio.asio, start);
+    if (e != ASE_OK) {
+        InterlockedExchange(&g_asio.running, 0);
+        LOGE("ASIO: prewarm start failed (%ld)", (long)e);
+        return E_FAIL;
+    }
+    LOGI("ASIO: prewarmed and idle at %.0f Hz", g_asio.rate);
+    return S_OK;
+}
+
 static void ZeroAsioOutputs(void)
 {
     if (!g_asio.have_buffers) return;
@@ -435,14 +487,33 @@ static void ZeroAsioOutputs(void)
     }
 }
 
+static HRESULT SilenceTask(void* param)
+{
+    AMB_UNUSED(param);
+    ZeroAsioOutputs();
+    return S_OK;
+}
+
+static HRESULT DetachTask(void* param)
+{
+    AmbRing* ring = (AmbRing*)param;
+    if (g_asio.consumer.ring == ring) {
+        ZeroMemory(&g_asio.consumer, sizeof(g_asio.consumer));
+    }
+    return S_OK;
+}
+
 static HRESULT StopTask(void* param)
 {
     AMB_UNUSED(param);
     if (!g_asio.asio) return S_OK;
     InterlockedExchange(&g_asio.running, 0);
     if (g_asio.have_buffers) {
-        IASIO_CALLO(g_asio.asio, stop);
+        /* ASIO stop can block for several seconds.  Clear the hardware
+           buffers first so the driver cannot keep replaying the last track
+           while it is being shut down. */
         ZeroAsioOutputs();
+        IASIO_CALLO(g_asio.asio, stop);
     }
     return S_OK;
 }
@@ -468,8 +539,8 @@ static HRESULT CloseStreamTask(void* param)
     if (!g_asio.asio) return S_OK;
     InterlockedExchange(&g_asio.running, 0);
     if (g_asio.have_buffers) {
-        IASIO_CALLO(g_asio.asio, stop);
         ZeroAsioOutputs();
+        IASIO_CALLO(g_asio.asio, stop);
         IASIO_CALLO(g_asio.asio, disposeBuffers);
         g_asio.have_buffers = 0;
     }
@@ -589,6 +660,20 @@ HRESULT AsioHost_OpenStream(double rate, int channels, int buffer_frames, AsioFo
     return hr;
 }
 
+BOOL AsioHost_Prewarm(double rate, int channels, int buffer_frames)
+{
+    AsioFormatInfo info;
+    if (rate <= 0.0) {
+        double current = 0.0;
+        if (FAILED(CtlCall(GetRateTask, &current)) || current <= 0.0) return FALSE;
+        rate = current;
+    }
+    HRESULT hr = AsioHost_OpenStream(rate, channels, buffer_frames, &info);
+    if (FAILED(hr)) return FALSE;
+    hr = CtlCall(PrewarmTask, NULL);
+    return SUCCEEDED(hr);
+}
+
 void AsioHost_SetConsumer(const AsioConsumer* consumer)
 {
     if (!consumer) return;
@@ -603,6 +688,16 @@ HRESULT AsioHost_Start(void)
 void AsioHost_Stop(void)
 {
     CtlCall(StopTask, NULL);
+}
+
+void AsioHost_SilenceOutputs(void)
+{
+    CtlCall(SilenceTask, NULL);
+}
+
+void AsioHost_DetachConsumer(AmbRing* ring)
+{
+    if (ring) CtlCall(DetachTask, ring);
 }
 
 void AsioHost_CloseStream(void)
@@ -700,7 +795,8 @@ static void Asio_BufferSwitch(long index, ASIOBool direct)
         if (fill < want) InterlockedIncrement(&g_asio.underruns);
     }
 
-    BOOL mute = AMB_ASIO_SILENCE ? TRUE : (c->mute ? *c->mute : FALSE);
+    BOOL gated = c->gate ? (*c->gate != FALSE) : FALSE;
+    BOOL mute = gated || (AMB_ASIO_SILENCE ? TRUE : (c->mute ? *c->mute : FALSE));
     float gain = c->gain ? *c->gain : 1.0f;
     BOOL apply_gain = c->volume_enabled && c->is_float &&
                       (mute || fabsf(gain - 1.0f) > 1e-7f);

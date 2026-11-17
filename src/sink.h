@@ -9,6 +9,7 @@ typedef struct AmbSink {
     HRESULT (*Start)(struct AmbSink* sink);
     void (*Stop)(struct AmbSink* sink);
     void (*Close)(struct AmbSink* sink);
+    LONG64 (*GetPlayed)(struct AmbSink* sink);
     uint32_t period_frames;
     BOOL bitperfect;
 } AmbSink;
